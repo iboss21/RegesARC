@@ -1,0 +1,5339 @@
+/* deepseek_v41.c — DeepSeek-V4.1-Flash on a machine that cannot hold it.
+ *
+ * 552B parameters, 510 GB on disk, and the shape of it is why this engine exists:
+ *
+ *   engram  203 GB  two n-gram memories (384M rows x 264 B) read by hash: at most
+ *                   (max_ngram-1) * n_heads rows per layer per token, so ~13 KB of
+ *                   random reads for 40% of the model. Streaming is not a compromise
+ *                   here, it is the only sane way to serve it.
+ *   experts 289 GB  15,360 fp4 experts of 18.8 MB; 6 of 384 routed per layer, so
+ *                   4.5 GB per token, cached in RAM by the same LRU as every other
+ *                   family here (GLM-5.2 reads 12.7 GB per token for comparison).
+ *   dense    18 GB  attention, gates, norms, hyper-connection mixers: resident.
+ *
+ * No conversion step: the released checkpoint is already fp8 (dense, 32x32 ue8m0
+ * block scales) and fp4 (experts, ue8m0 per 32-column group), and the fp4 layout is
+ * byte-identical to the mxfp4 colibri already reads for Kimi K3, so quant.h's
+ * matmul_mxfp4 is the expert kernel. What the container does need is a sidecar the
+ * engine cannot compute (tools/prepare_dsv41.py): the engram bucket primes (sympy),
+ * the hash multipliers (numpy PCG64) and the compressed-token map (the tokenizer's
+ * normalizer). Those are tables, not weights.
+ *
+ * Mechanisms, each mirroring a named piece of the vendor's inference/model.py:
+ *   hyper-connections    hc_mult parallel residual streams, mixed through a
+ *                        doubly-stochastic matrix (Sinkhorn) — hyper_connections.h,
+ *                        shared with DeepSeek V4 and GLM-5.3-Flash
+ *   sliding window       every layer attends a ring of `window_size` raw KV, MQA:
+ *                        one KV vector per position for all heads
+ *   compressed KV        kv_source_layers pool `compress_ratio` tokens into one
+ *                        latent with a softmax gate and publish it; the layers
+ *                        between them read that same cache
+ *   DSA indexer          index_source_layers score compressed positions and keep
+ *                        index_topk of them, two-level when a candidate source is
+ *                        configured
+ *   engram               n-gram hash lookups gated into the residual stream
+ *   MoE                  sqrtsoftplus scores, noaux_tc bias picks but does not
+ *                        scale, one shared expert every token pays
+ *
+ * The reference this engine is held to is tools/dsv41_ref.py (torch, CPU): the
+ * vendor's own forward runs on tilelang GPU kernels and cannot be an oracle here.
+ */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+#include <errno.h>
+#include <time.h>
+#include <stdarg.h>
+/* Windows has no <sys/resource.h>; compat.h supplies getrusage over
+ * GetProcessMemoryInfo, and every other engine guards the include the same way. */
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#include <sys/resource.h>
+#endif
+#if defined(COLI_VULKAN) && !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#include "cli_args.h"
+#include "compat.h"
+#include "json.h"
+#include "st.h"
+#include "quant.h"
+#include "sparse_attn.h"
+#include "omp_tune.h"
+#include "kv_prefix.h"
+#include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
+#include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+#include "hyper_connections.h"
+#include "tok.h"
+#include "serve_codec.h"
+#include "serve_poll.h"
+#ifdef COLI_VULKAN
+#include "backend_vulkan.h"
+#include "vk_tier.h"
+#include "route_trace.h"   /* the tier's expert history (.coli_usage), kept while it is on */
+#include "vk_chain.h"      /* vkc_fit: how many layers the dense chain places (a partial chain) */
+/* 1 once COLI_VULKAN=1 opened a device, after the weights load (a VK=1 build). */
+static int g_vk_ready = 0;
+/* The partial chain (deepseek_v41_chain.h, v41c_fit_now): the first g_v41_fit.n layers on
+ * the device, decided once before anything goes up. g_v41_partial: something the full
+ * chain would place stays on the CPU (layers, the head), so the per-matrix path uploads
+ * nothing that is not on the device already. */
+static VkcFit g_v41_fit;
+static int g_v41_fit_done, g_v41_partial;
+static int g_v41_dho_try;   /* the fit runs where the trunk may live on the device only (v41_dho_open) */
+#endif
+#ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
+static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
+static inline void vkt_ram_gave(void) {}
+#endif
+
+#define V41_MAX_LAYERS 64
+#define V41_MAX_ENGRAM 4
+#define V41_MAX_NGRAM 8
+#define V41_MAX_EHEADS 16
+
+/* ---------------------------------------------------------------- config ---- */
+
+typedef struct {
+    int vocab, dim, n_layers, n_heads, head_dim, rope_dim;
+    int q_lora, o_lora, o_groups;
+    int moe_inter, n_routed, n_activated, n_shared;
+    int norm_topk_prob;
+    float route_scale, gate_temp, swiglu_limit, norm_eps;
+    int window;
+    int compress_ratio[V41_MAX_LAYERS];
+    int kv_source[V41_MAX_LAYERS];      /* 1 = this layer owns a compressed KV cache */
+    int index_source[V41_MAX_LAYERS];   /* 1 = this layer runs its own indexer       */
+    int index_owner[V41_MAX_LAYERS];    /* which kv_source layer's caches it reads   */
+    float compress_rope_theta, rope_theta, rope_factor;
+    int original_seq_len, beta_fast, beta_slow;
+    int index_n_heads, index_head_dim, index_topk;
+    int candidate_source, candidate_topk_blocks, candidate_block_size;
+    int hc_mult, hc_iters;
+    float hc_eps;
+    int max_positions;
+    /* engram */
+    int n_engram, engram_layer[V41_MAX_ENGRAM];
+    int64_t engram_rows[V41_MAX_ENGRAM];
+    int engram_max_ngram, engram_heads, engram_head_dim, engram_pad_id;
+    int engram_cols;                     /* (max_ngram - 1) * heads */
+    /* DSpark: the MTP draft head. n_mtp == 0 means the checkpoint carries none. */
+    int n_mtp, spec_block, spec_noise, spec_targets[8], n_spec_targets;
+    int markov_rank, spec_routed, spec_activated;
+    /* vision (VL). vision_layers == 0 means a text-only container. */
+    int vision_layers, vision_dim, vision_heads, vision_inter, vision_patch;
+    int vision_ratio, vision_max_tokens, image_token_id;
+    float vision_rope_theta;
+} Cfg;
+
+static double jnum(jval *o, const char *key, double fallback) {
+    jval *v = o ? json_get(o, key) : NULL;
+    return (v && v->t == J_NUM) ? v->num : fallback;
+}
+
+static int jints(jval *o, const char *key, int *out, int cap) {
+    jval *v = o ? json_get(o, key) : NULL;
+    if (!v || v->t != J_ARR) return 0;
+    int n = v->len < cap ? v->len : cap;
+    for (int i = 0; i < n; i++) out[i] = (int)v->kids[i]->num;
+    return n;
+}
+
+/* The released config nests everything the text model needs under `text_config`;
+ * the tiny fixture does the same, so one reader serves both. */
+static void cfg_load(Cfg *c, const char *snap) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/config.json", snap);
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[cfg] %s: %s\n", path, strerror(errno)); exit(1); }
+    fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
+    char *text = malloc((size_t)size + 1);
+    if (!text || fread(text, 1, (size_t)size, f) != (size_t)size) {
+        fprintf(stderr, "[cfg] short read on %s\n", path); exit(1); }
+    text[size] = 0; fclose(f);
+    char *arena = NULL;
+    jval *root = json_parse(text, &arena);
+    if (!root) { fprintf(stderr, "[cfg] %s is not valid JSON\n", path); exit(1); }
+    jval *t = json_get(root, "text_config");
+    if (!t) t = root;   /* a flat config is accepted: the fields are the same */
+
+    memset(c, 0, sizeof(*c));
+    c->vocab      = (int)jnum(t, "vocab_size", 0);
+    c->dim        = (int)jnum(t, "dim", jnum(t, "hidden_size", 0));
+    c->n_layers   = (int)jnum(t, "n_layers", jnum(t, "num_hidden_layers", 0));
+    c->n_heads    = (int)jnum(t, "n_heads", jnum(t, "num_attention_heads", 0));
+    c->head_dim   = (int)jnum(t, "head_dim", 0);
+    c->rope_dim   = (int)jnum(t, "rope_head_dim", jnum(t, "qk_rope_head_dim", 0));
+    c->q_lora     = (int)jnum(t, "q_lora_rank", 0);
+    c->o_lora     = (int)jnum(t, "o_lora_rank", 0);
+    c->o_groups   = (int)jnum(t, "o_groups", 1);
+    c->moe_inter  = (int)jnum(t, "moe_inter_dim", jnum(t, "moe_intermediate_size", 0));
+    c->n_routed   = (int)jnum(t, "n_routed_experts", 0);
+    c->n_activated= (int)jnum(t, "n_activated_experts", jnum(t, "num_experts_per_tok", 0));
+    c->n_shared   = (int)jnum(t, "n_shared_experts", 1);
+    c->norm_topk_prob = (int)jnum(t, "norm_topk_prob", 1);
+    c->route_scale= (float)jnum(t, "route_scale", jnum(t, "routed_scaling_factor", 1.0));
+    c->gate_temp  = (float)jnum(t, "gate_temp", 1.0);
+    c->swiglu_limit = (float)jnum(t, "swiglu_limit", 0.0);
+    c->norm_eps   = (float)jnum(t, "norm_eps", jnum(t, "rms_norm_eps", 1e-6));
+    c->window     = (int)jnum(t, "window_size", jnum(t, "sliding_window", 128));
+    c->compress_rope_theta = (float)jnum(t, "compress_rope_theta", 40000.0);
+    c->rope_theta = (float)jnum(t, "rope_theta", 10000.0);
+    c->rope_factor= (float)jnum(t, "rope_factor", 1.0);
+    c->original_seq_len = (int)jnum(t, "original_seq_len", 0);
+    c->beta_fast  = (int)jnum(t, "beta_fast", 32);
+    c->beta_slow  = (int)jnum(t, "beta_slow", 1);
+    c->index_n_heads = (int)jnum(t, "index_n_heads", 0);
+    c->index_head_dim= (int)jnum(t, "index_head_dim", 0);
+    c->index_topk = (int)jnum(t, "index_topk", 0);
+    c->candidate_source = (int)jnum(t, "candidate_source_layer",
+                                    jnum(t, "candidate_source_layer_id", -1));
+    c->candidate_topk_blocks = (int)jnum(t, "candidate_topk_blocks", 0);
+    c->candidate_block_size  = (int)jnum(t, "candidate_block_size", 0);
+    c->hc_mult    = (int)jnum(t, "hc_mult", 1);
+    c->hc_iters   = (int)jnum(t, "hc_sinkhorn_iters", 20);
+    c->hc_eps     = (float)jnum(t, "hc_eps", 1e-6);
+    c->max_positions = (int)jnum(t, "max_seq_len", jnum(t, "max_position_embeddings", 4096));
+    /* CTX caps the context, and with it every buffer sized from it: the compressed
+     * KV and index keys of the four source layers, and both rope tables. Every
+     * other engine in the registry reads its own context variable (CTX, GLM53_MAXT,
+     * CTX_MAX, K3_MAXT, Q36_MAXT, Q38_MAXT); this one read none, so `coli --ctx`
+     * set CTX for the planner and the engine ignored it. The planner sizes those
+     * buffers from the context it was asked for, which at the default 4096 is
+     * 0.02 GiB against the 6.25 GiB the engine allocated for the checkpoint's
+     * 1,048,576 -- 6.23 GiB of unbudgeted allocation, and a machine planned to the
+     * number would not have it. Keeping CTX <= max_positions also means the
+     * checkpoint's own ceiling still wins: this can only ask for less. */
+    const char *ctx_env = getenv("CTX");
+    if (ctx_env && *ctx_env) {
+        int ctx = atoi(ctx_env);
+        if (ctx >= 2 && ctx < c->max_positions) c->max_positions = ctx;
+        else if (ctx >= 2)
+            fprintf(stderr, "[v41] CTX=%d is at or above the checkpoint's own ceiling "
+                            "of %d positions; keeping the ceiling\n", ctx, c->max_positions);
+        else
+            fprintf(stderr, "[v41] CTX=%d is below the 2-position minimum; ignored\n", ctx);
+    }
+    /* YaRN, as the vendor spells it: rope_scaling.factor when present */
+    jval *scaling = json_get(t, "rope_scaling");
+    if (scaling && scaling->t == J_OBJ) {
+        c->rope_factor = (float)jnum(scaling, "factor", c->rope_factor);
+        c->beta_fast = (int)jnum(scaling, "beta_fast", c->beta_fast);
+        c->beta_slow = (int)jnum(scaling, "beta_slow", c->beta_slow);
+        c->original_seq_len = (int)jnum(scaling, "original_max_position_embeddings",
+                                        c->original_seq_len);
+    }
+
+    if (c->n_layers < 1 || c->n_layers > V41_MAX_LAYERS) {
+        fprintf(stderr, "[cfg] n_layers %d out of range\n", c->n_layers); exit(1); }
+    /* The rope turns the last rope_head_dim floats of every attention row (head_dim long)
+     * and of every index query and key (index_head_dim long): it must fit both, in pairs
+     * (the release: 64 of 512 and of 128). */
+    if (c->head_dim < 1 || c->rope_dim < 0 || (c->rope_dim & 1) || c->rope_dim > c->head_dim ||
+        c->index_head_dim < 0 || (c->index_head_dim > 0 && c->rope_dim > c->index_head_dim)) {
+        fprintf(stderr, "[cfg] rope_head_dim %d does not fit head_dim %d and index_head_dim %d\n",
+                c->rope_dim, c->head_dim, c->index_head_dim); exit(1); }
+    int ratios[V41_MAX_LAYERS] = {0};
+    int nr = jints(t, "compress_ratios", ratios, V41_MAX_LAYERS);
+    if (nr < c->n_layers) {
+        fprintf(stderr, "[cfg] compress_ratios has %d entries for %d layers\n",
+                nr, c->n_layers); exit(1); }
+    for (int i = 0; i < c->n_layers; i++) c->compress_ratio[i] = ratios[i];
+    int src[V41_MAX_LAYERS];
+    int n = jints(t, "kv_source_layers", src, V41_MAX_LAYERS);
+    if (!n) n = jints(t, "kv_source_layer_ids", src, V41_MAX_LAYERS);
+    for (int i = 0; i < n; i++) if (src[i] >= 0 && src[i] < c->n_layers) c->kv_source[src[i]] = 1;
+    n = jints(t, "index_source_layers", src, V41_MAX_LAYERS);
+    if (!n) n = jints(t, "index_source_layer_ids", src, V41_MAX_LAYERS);
+    for (int i = 0; i < n; i++) if (src[i] >= 0 && src[i] < c->n_layers) c->index_source[src[i]] = 1;
+    /* Who owns the caches a layer reads: the nearest kv_source at or before it.
+     * The vendor keeps this implicit in a module-level object that the source
+     * writes and everyone after reads; making it explicit here means a layer can
+     * be served without replaying the ones before it. */
+    int owner = -1;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->kv_source[i]) owner = i;
+        c->index_owner[i] = owner;
+    }
+    /* DSpark. The released config spells the activated count two ways depending on
+     * which file it comes from (config.json says dspark_num_experts_per_tok,
+     * inference/config.json says dspark_n_activated_experts); read either. */
+    c->n_mtp = (int)jnum(t, "n_mtp_layers", 0);
+    c->spec_block = (int)jnum(t, "dspark_block_size", 0);
+    c->spec_noise = (int)jnum(t, "dspark_noise_token_id", 0);
+    c->n_spec_targets = jints(t, "dspark_target_layer_ids", c->spec_targets, 8);
+    c->markov_rank = (int)jnum(t, "dspark_markov_rank", 0);
+    c->spec_routed = (int)jnum(t, "dspark_n_routed_experts", c->n_routed);
+    c->spec_activated = (int)jnum(t, "dspark_n_activated_experts",
+                                 jnum(t, "dspark_num_experts_per_tok", c->n_activated));
+    if (c->spec_block <= 0 || c->n_spec_targets <= 0) c->n_mtp = 0;
+
+    jval *vision = json_get(root, "vision_config");
+    if (vision && vision->t == J_OBJ) {
+        c->vision_layers = (int)jnum(vision, "num_hidden_layers", 0);
+        c->vision_dim    = (int)jnum(vision, "hidden_size", 0);
+        c->vision_heads  = (int)jnum(vision, "num_attention_heads", 0);
+        c->vision_inter  = (int)jnum(vision, "intermediate_size", 0);
+        c->vision_patch  = (int)jnum(vision, "patch_size", 0);
+        c->vision_ratio  = (int)jnum(vision, "downsample_ratio", 1);
+        c->vision_max_tokens = (int)jnum(vision, "max_image_tokens", 0);
+        c->vision_rope_theta = (float)jnum(vision, "rope_theta", 10000.0);
+    }
+    c->image_token_id = (int)jnum(root, "image_token_id", -1);
+    json_free(root); free(arena); free(text);
+}
+
+/* ------------------------------------------------------- weights in RAM ---- */
+
+/* The dense trunk stays in the checkpoint's own formats: dequantizing fp8 to f32 at
+ * load would turn 18 GB into 72 GB, which is the whole point of not doing it. Each
+ * kernel below decodes as it multiplies. */
+typedef struct { uint8_t *q; uint8_t *s; int O, I; } W8;   /* e4m3 + 32x32 ue8m0 */
+typedef struct { uint16_t *w; int O, I; } WB;              /* bf16                */
+typedef struct { float *w; int64_t n; } WF;                /* f32                 */
+
+#define FP8_TILE 32
+
+/* Per-turn accounting on stderr. Off by default because `coli chat` shows the
+ * engine's stderr right next to the answer; V41_STATS=1 turns it on, which is
+ * what the benchmarks and the server scripts use. */
+static int v41_stats(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("V41_STATS") ? atoi(getenv("V41_STATS")) : 0;
+    return on;
+}
+
+/* V41_TRACE=1 prints a checksum of the tensors the reference prints too, so a
+ * divergence is located by diffing two columns rather than by reading two forwards. */
+static int g_trace = 0;
+static void trace(const char *name, int layer, const float *v, int n) {
+    if (!g_trace) return;
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += v[i];
+    fprintf(stderr, "T %-10s L%-2d n=%-5d sum=%+.6f [%+.6f %+.6f %+.6f]\n",
+            name, layer, n, sum, v[0], n > 1 ? v[1] : 0.0f, n > 2 ? v[2] : 0.0f);
+}
+
+static double rss_gb(void) {
+    struct rusage usage;
+    getrusage(RUSAGE_SELF, &usage);
+#ifdef __APPLE__
+    return usage.ru_maxrss / 1e9;
+#else
+    return usage.ru_maxrss / 1e6;
+#endif
+}
+
+static double now_s(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+static void *xmalloc(size_t bytes, const char *what) {
+    void *p = malloc(bytes ? bytes : 1);
+    if (!p) { fprintf(stderr, "OOM allocating %s (%zu bytes)\n", what, bytes); exit(1); }
+    return p;
+}
+static void *xcalloc(size_t count, size_t size, const char *what) {
+    void *p = calloc(count ? count : 1, size ? size : 1);
+    if (!p) { fprintf(stderr, "OOM allocating %s (%zu x %zu bytes)\n", what, count, size); exit(1); }
+    return p;
+}
+
+#ifdef COLI_VULKAN
+/* ---- dense weights on the device only (COLI_VK_DENSE_HOST) -------------------------
+ * With the trunk on the device (the chain, or COLI_VK_DENSE) and this mode on (decided
+ * by v41_dho_open in model_load, before the layers are read), each trunk matrix (the
+ * fp8 rows of every W8 of a layer, the compressor's, indexer's and engram's projections;
+ * not the router, the head, the embedding, the norms, DSpark's stages or the vision
+ * tower) is read into an anonymous mapping of its own, uploaded as every lookup will ask
+ * for it, and its pages given back with the address kept: the device copies are found
+ * by that address (vk_entry), and a matrix the CPU needs again (a lost device, a step
+ * the device declines) is read back from disk at it (v41_dho_host), and stays. */
+typedef struct {
+    unsigned char *base; size_t bytes;
+    char name[256];
+    int kind, O, I;                 /* 8: the e4m3 rows of a W8 (tiles below), 16: a WB */
+    const uint8_t *tiles;
+    int placed, gone;
+    int layer;                      /* the layer it belongs to (its name's), -1 none */
+} V41Home;
+static V41Home *g_v41_home;
+static size_t g_v41_home_n, g_v41_home_cap;
+static int g_v41_dho, g_v41_map, g_vk_opened;
+/* A partial chain: only the first g_v41_dho_layers layers' matrices go to the device only
+ * (the chain's layers); the others load as without Vulkan. g_v41_load_layer: the layer
+ * model_load is reading. */
+static int g_v41_dho_layers = V41_MAX_LAYERS, g_v41_load_layer = -1;
+static shards *g_v41_shards;
+static pthread_mutex_t g_v41_home_mx = PTHREAD_MUTEX_INITIALIZER;
+static size_t v41_map_len(size_t bytes) {
+#ifdef _WIN32
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    size_t page = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536;
+#else
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t page = ps > 0 ? (size_t)ps : 4096;
+#endif
+    return ((bytes ? bytes : 1) + page - 1) / page * page;
+}
+/* pages back with the range kept (and unreadable), and back again zeroed */
+static int v41_map_drop(void *p, size_t bytes) {
+#ifdef _WIN32
+    return VirtualFree(p, v41_map_len(bytes), MEM_DECOMMIT) ? 0 : -1;
+#else
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    return mmap(p, v41_map_len(bytes), PROT_NONE, flags, -1, 0) == MAP_FAILED ? -1 : 0;
+#endif
+}
+static int v41_map_restore(void *p, size_t bytes) {
+#ifdef _WIN32
+    return VirtualAlloc(p, v41_map_len(bytes), MEM_COMMIT, PAGE_READWRITE) == p ? 0 : -1;
+#else
+    return mprotect(p, v41_map_len(bytes), PROT_READ | PROT_WRITE);
+#endif
+}
+static void *v41_home_alloc(size_t bytes, const char *name) {
+#ifdef _WIN32
+    void *p = VirtualAlloc(NULL, v41_map_len(bytes), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p) { fprintf(stderr, "OOM mapping %s (%zu bytes)\n", name, bytes); exit(1); }
+#else
+    void *p = mmap(NULL, v41_map_len(bytes), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) { fprintf(stderr, "OOM mapping %s (%zu bytes)\n", name, bytes); exit(1); }
+#endif
+    if (g_v41_home_n == g_v41_home_cap) {
+        g_v41_home_cap = g_v41_home_cap ? 2 * g_v41_home_cap : 256;
+        g_v41_home = realloc(g_v41_home, g_v41_home_cap * sizeof(*g_v41_home));
+        if (!g_v41_home) { fprintf(stderr, "OOM dense weights table\n"); exit(1); }
+    }
+    V41Home *h = &g_v41_home[g_v41_home_n++];
+    memset(h, 0, sizeof *h);
+    h->base = p; h->bytes = bytes;
+    snprintf(h->name, sizeof h->name, "%s", name);
+    if (sscanf(name, "layers.%d.", &h->layer) != 1) h->layer = -1;
+    return p;
+}
+static V41Home *v41_home_of(const void *data) {
+    uintptr_t q = (uintptr_t)data;
+    for (size_t i = 0; i < g_v41_home_n; i++)
+        if (q >= (uintptr_t)g_v41_home[i].base && q - (uintptr_t)g_v41_home[i].base < g_v41_home[i].bytes)
+            return &g_v41_home[i];
+    return NULL;
+}
+/* The CPU is about to read the matrix that holds `data`: read back what the device held
+ * alone, at its own address. */
+static void v41_dho_host(const void *data) {
+    if (!g_v41_dho || !data) return;
+    pthread_mutex_lock(&g_v41_home_mx);
+    V41Home *h = v41_home_of(data);
+    if (h && h->gone) {
+        if (v41_map_restore(h->base, h->bytes)) {
+            fprintf(stderr, "[VK] deepseek_v41: %s could not come back into RAM\n", h->name); exit(1);
+        }
+        st_read_raw_cap(g_v41_shards, h->name, h->base, (int64_t)h->bytes, 0);
+        h->gone = 0;
+        coli_vk_dense_host_reloaded(h->bytes);
+    }
+    pthread_mutex_unlock(&g_v41_home_mx);
+}
+#endif
+static void *v41_weight_alloc(size_t bytes, const char *name) {
+#ifdef COLI_VULKAN
+    if (g_v41_map) return v41_home_alloc(bytes, name);
+#endif
+    return xmalloc(bytes, name);
+}
+
+static void w8_load(shards *S, W8 *w, const char *name, int O, int I) {
+    char scale_name[512];
+    snprintf(scale_name, sizeof(scale_name), "%.*s.scale",
+             (int)(strlen(name) - strlen(".weight")), name);
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "%s: missing\n", name); exit(1); }
+    if (t->nbytes != (int64_t)O * I) {
+        fprintf(stderr, "%s: %lld bytes, expected %lld for [%d, %d] fp8\n",
+                name, (long long)t->nbytes, (long long)O * I, O, I); exit(1); }
+    int tiles = ((O + FP8_TILE - 1) / FP8_TILE) * ((I + FP8_TILE - 1) / FP8_TILE);
+    w->O = O; w->I = I;
+    w->q = v41_weight_alloc((size_t)O * I, name);
+    w->s = xmalloc((size_t)tiles, scale_name);
+    st_read_raw_cap(S, name, w->q, (int64_t)O * I, 0);
+    st_read_raw_cap(S, scale_name, w->s, tiles, 0);
+#ifdef COLI_VULKAN
+    if (g_v41_map) { V41Home *h = &g_v41_home[g_v41_home_n - 1]; h->kind = 8; h->O = O; h->I = I; h->tiles = w->s; }
+#endif
+}
+
+static void wb_load(shards *S, WB *w, const char *name, int O, int I) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "%s: missing\n", name); exit(1); }
+    if (t->nbytes != (int64_t)O * I * 2) {
+        fprintf(stderr, "%s: %lld bytes, expected %lld for [%d, %d] bf16\n",
+                name, (long long)t->nbytes, (long long)O * I * 2, O, I); exit(1); }
+    w->O = O; w->I = I;
+    w->w = v41_weight_alloc((size_t)O * I * 2, name);
+    st_read_raw_cap(S, name, w->w, (int64_t)O * I * 2, 0);
+#ifdef COLI_VULKAN
+    if (g_v41_map) { V41Home *h = &g_v41_home[g_v41_home_n - 1]; h->kind = 16; h->O = O; h->I = I; }
+#endif
+}
+
+static void wf_load(shards *S, WF *w, const char *name, int64_t n) {
+    w->n = n;
+    w->w = xmalloc((size_t)n * sizeof(float), name);
+    /* st_read_f32 widens bf16/f16 as well, so a checkpoint that stores one of these
+     * small tensors in bf16 rather than f32 still loads.
+     * SEC: capped, because `n` comes from config.json and the element count from the
+     * file. Uncapped, a tensor longer than `n` was copied over the heap first and
+     * refused second, by the count check below, after the damage. */
+    if (st_read_f32_cap(S, name, w->w, n, 0) != n) {
+        fprintf(stderr, "%s: expected %lld floats\n", name, (long long)n); exit(1); }
+}
+
+/* 2^(byte - 127) without a call: ue8m0 is a bare exponent, so the byte lands straight
+ * in an IEEE exponent field. byte 0 and 255 (denormal / inf) never occur in a real
+ * checkpoint and decode to +0 and +inf here, matching quant.h's mxfp4 path. */
+static inline float ue8m0(uint8_t byte) {
+    union { uint32_t u; float f; } value;
+    value.u = (uint32_t)byte << 23;
+    return value.f;
+}
+
+#ifdef COLI_VULKAN
+/* The resident trunk on the Vulkan device (COLI_VULKAN=1 in a VK=1 build), in the
+ * checkpoint's own formats: a W8 goes up as fmt 12, e4m3 with one f32 scale per 32
+ * inputs, each 32x32 tile's ue8m0 written out for its 32 rows; a WB as fmt 11, bf16.
+ * The CPU kernels multiply the same f32 activations, with no rounding of their own,
+ * so the device computes the same products and only sums them in another order.
+ * The routed experts stay on the CPU: they come from disk into an LRU slot and leave
+ * it again.
+ *
+ * The device copy is found by the weight pointer rather than kept in the matrix:
+ * wo_a's per-group blocks are W8 views built on the stack at every call, and a field
+ * there would upload them again each time. Every W8 and WB this engine multiplies
+ * lives as long as the model, so a pointer names the same bytes for the whole run.
+ * One command buffer: calls come from the thread that opened the device and never
+ * from inside an OpenMP region; anything else stays on the CPU. */
+typedef struct { const void *data; int fmt, O, I, refused; ColiVkTensor *t; int dho; } VkEntry;   /* dho: placed, the device holds it alone */
+static VkEntry *g_vk_map;
+static size_t g_vk_cap, g_vk_used;
+static pthread_t g_vk_thread;
+
+static size_t vk_hash(const void *data, size_t cap) {
+    uint64_t h = (uint64_t)(uintptr_t)data * 0x9E3779B97F4A7C15ull;
+    return (size_t)(h >> 20) & (cap - 1);
+}
+
+static VkEntry *vk_entry(const void *data, int fmt, int O, int I) {
+    if ((g_vk_used + 1) * 2 > g_vk_cap) {
+        size_t cap = g_vk_cap ? g_vk_cap * 2 : 256;
+        VkEntry *map = calloc(cap, sizeof(*map));
+        if (!map) return NULL;
+        for (size_t i = 0; i < g_vk_cap; i++) {
+            if (!g_vk_map[i].data) continue;
+            size_t at = vk_hash(g_vk_map[i].data, cap);
+            while (map[at].data) at = (at + 1) & (cap - 1);
+            map[at] = g_vk_map[i];
+        }
+        free(g_vk_map);
+        g_vk_map = map; g_vk_cap = cap;
+    }
+    size_t at = vk_hash(data, g_vk_cap);
+    for (;; at = (at + 1) & (g_vk_cap - 1)) {
+        VkEntry *e = &g_vk_map[at];
+        if (!e->data) {
+            *e = (VkEntry){data, fmt, O, I, 0, NULL, 0};
+            g_vk_used++;
+            return e;
+        }
+        if (e->data == data && e->fmt == fmt && e->O == O && e->I == I) return e;
+    }
+}
+
+/* The entry of a matrix, NULL when it has none (no insertion). */
+static VkEntry *vk_find(const void *data, int fmt, int O, int I) {
+    if (!g_vk_cap) return NULL;
+    for (size_t at = vk_hash(data, g_vk_cap);; at = (at + 1) & (g_vk_cap - 1)) {
+        VkEntry *e = &g_vk_map[at];
+        if (!e->data) return NULL;
+        if (e->data == data && e->fmt == fmt && e->O == O && e->I == I) return e;
+    }
+}
+
+/* y = W x for `rows` positions on the device; 0 sends the caller to its CPU kernel.
+ * x and y may be strided (wo_a's blocks read and write inside wider rows): the
+ * device wants them packed, so they are packed here. */
+static int vk_mul(int fmt, const void *data, const uint8_t *tiles, int O, int I,
+                  float *y, int ystride, const float *x, int xstride, int rows) {
+    if (!g_vk_ready || rows < 1 || !pthread_equal(pthread_self(), g_vk_thread)) return 0;
+    /* COLI_VK_DENSE=0: the CPU, except for a matrix the device holds alone */
+    if (!coli_vk_dense()) { VkEntry *f = vk_find(data, fmt, O, I); if (!f || !f->dho) return 0; }
+#ifdef _OPENMP
+    if (omp_in_parallel()) return 0;
+#endif
+    VkEntry *e = vk_entry(data, fmt, O, I);
+    if (!e || e->refused) return 0;
+    if (!e->t && g_v41_partial) return 0;   /* a partial chain: what is not on the device stays on the CPU */
+    if (!e->t) v41_dho_host(data);   /* a view the placement did not make: its rows back first */
+    float *scales = NULL;
+    if (!e->t && fmt == 12) {
+        int groups = (I + FP8_TILE - 1) / FP8_TILE;
+        scales = malloc((size_t)O * groups * sizeof(float));
+        if (!scales) return 0;
+        for (int o = 0; o < O; o++)
+            for (int g = 0; g < groups; g++)
+                scales[(size_t)o * groups + g] = ue8m0(tiles[(size_t)(o / FP8_TILE) * groups + g]);
+    }
+    int pack_x = rows > 1 && xstride != I, pack_y = rows > 1 && ystride != O;
+    float *xp = pack_x ? malloc((size_t)rows * I * sizeof(float)) : NULL;
+    float *yp = pack_y ? malloc((size_t)rows * O * sizeof(float)) : NULL;
+    int ok = 0;
+    if ((!pack_x || xp) && (!pack_y || yp)) {
+        for (int r = 0; pack_x && r < rows; r++)
+            memcpy(xp + (size_t)r * I, x + (size_t)r * xstride, (size_t)I * sizeof(float));
+        int had = e->t != NULL;
+        ok = coli_vk_matmul(&e->t, pack_y ? yp : y, pack_x ? xp : x, data, scales,
+                            fmt, rows, I, O, fmt == 12 ? FP8_TILE : 0);
+        if (!ok && !had && !e->t) e->refused = 1;   /* no device room: CPU from now on */
+        for (int r = 0; ok && pack_y && r < rows; r++)
+            memcpy(y + (size_t)r * ystride, yp + (size_t)r * O, (size_t)O * sizeof(float));
+    }
+    free(xp); free(yp); free(scales);
+    return ok;
+}
+#endif
+
+/* y[O] = W [O, I] x[I], W in e4m3 with one ue8m0 scale per 32x32 tile.
+ *
+ * The dense trunk's matvec, and the reason it is worth vectorising: V4.1's
+ * attention projects 64 heads of 512, so wq_b alone is 32768 x 1536 per layer
+ * and forty layers of it are several GFLOP per token. Measured on the released
+ * checkpoint, the attention block was 41% of a turn's wall clock -- more than
+ * the expert reads from disk. A scalar byte-at-a-time decode was most of it. */
+static void mv8(float *y, const W8 *w, const float *x) {
+#ifdef COLI_VULKAN
+    if (vk_mul(12, w->q, w->s, w->O, w->I, y, w->O, x, w->I, 1)) return;
+    v41_dho_host(w->q);
+#endif
+    int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < w->O; o++) {
+        const uint8_t *row = w->q + (size_t)o * I;
+        const uint8_t *scale = w->s + (size_t)(o / FP8_TILE) * tiles_i;
+        float sum = 0.0f;
+        for (int base = 0; base < I; base += FP8_TILE) {
+            int width = I - base < FP8_TILE ? I - base : FP8_TILE;
+            float tile = ue8m0(scale[base / FP8_TILE]);
+            float part = 0.0f;
+#if defined(__AVX2__)
+            if (width == FP8_TILE) {
+                __m256 acc = _mm256_setzero_ps();
+                for (int i = 0; i < FP8_TILE; i += 8)
+                    acc = _mm256_fmadd_ps(e4m3_decode8(row + base + i),
+                                          _mm256_loadu_ps(x + base + i), acc);
+                part = hsum256(acc);
+            } else
+#endif
+            for (int i = 0; i < width; i++) part += e4m3_decode(row[base + i]) * x[base + i];
+            sum += part * tile;
+        }
+        y[o] = sum;
+    }
+}
+
+/* mv8 and mvb for a block of positions at once.
+ *
+ * The matrix is the thing that does not fit in cache -- wq_b is 42 MB on the
+ * released checkpoint, and so is wo_b -- while a block of positions does. Driving
+ * the block through one pass of the matrix instead of one pass per position turns
+ * prefill's twenty-six trips over 42 MB into a single trip, which is memory
+ * traffic the FMA units were waiting on rather than arithmetic.
+ *
+ * Values are bit-identical to the one-at-a-time kernels, not merely close: each
+ * output still folds the same tiles in the same order, and the decoded weight
+ * being held across the block instead of re-decoded per position does not change
+ * what is multiplied. The block is capped so the positions stay in L2 while the
+ * matrix streams past. */
+#define MV_ROWS_MAX 32
+
+static int mv_block_rows(int I) {
+    int block = (int)((192 * 1024) / ((size_t)I * sizeof(float) + 1));
+    if (block > MV_ROWS_MAX) block = MV_ROWS_MAX;
+    return block < 1 ? 1 : block;
+}
+
+static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
+#ifdef COLI_VULKAN
+    if (vk_mul(12, w->q, w->s, w->O, w->I, y, ystride, x, xstride, rows)) return;
+    v41_dho_host(w->q);
+#endif
+    int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
+    int block = mv_block_rows(I);
+    for (int r0 = 0; r0 < rows; r0 += block) {
+        int nr = rows - r0 < block ? rows - r0 : block;
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < w->O; o++) {
+            const uint8_t *row = w->q + (size_t)o * I;
+            const uint8_t *scale = w->s + (size_t)(o / FP8_TILE) * tiles_i;
+            float sum[MV_ROWS_MAX];
+            for (int r = 0; r < nr; r++) sum[r] = 0.0f;
+            for (int base = 0; base < I; base += FP8_TILE) {
+                int width = I - base < FP8_TILE ? I - base : FP8_TILE;
+                float tile = ue8m0(scale[base / FP8_TILE]);
+#if defined(__AVX2__)
+                if (width == FP8_TILE) {
+                    __m256 w0 = e4m3_decode8(row + base);
+                    __m256 w1 = e4m3_decode8(row + base + 8);
+                    __m256 w2 = e4m3_decode8(row + base + 16);
+                    __m256 w3 = e4m3_decode8(row + base + 24);
+                    for (int r = 0; r < nr; r++) {
+                        const float *xr = x + (size_t)(r0 + r) * xstride + base;
+                        __m256 acc = _mm256_mul_ps(w0, _mm256_loadu_ps(xr));
+                        acc = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xr + 8), acc);
+                        acc = _mm256_fmadd_ps(w2, _mm256_loadu_ps(xr + 16), acc);
+                        acc = _mm256_fmadd_ps(w3, _mm256_loadu_ps(xr + 24), acc);
+                        sum[r] += hsum256(acc) * tile;
+                    }
+                    continue;
+                }
+#endif
+                for (int r = 0; r < nr; r++) {
+                    const float *xr = x + (size_t)(r0 + r) * xstride + base;
+                    float part = 0.0f;
+                    for (int i = 0; i < width; i++) part += e4m3_decode(row[base + i]) * xr[i];
+                    sum[r] += part * tile;
+                }
+            }
+            for (int r = 0; r < nr; r++) y[(size_t)(r0 + r) * ystride + o] = sum[r];
+        }
+    }
+}
+
+static void mvb_cpu(float *y, const WB *w, const float *x) {
+    int I = w->I;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < w->O; o++) {
+        const uint16_t *row = w->w + (size_t)o * I;
+        float sum = 0.0f;
+        int i = 0;
+#if defined(__AVX2__)
+        /* The lm head is [vocab, dim] in bf16: 129280 x 5120 is 662 million
+         * multiply-adds for one token, and it runs once per position. */
+        __m256 acc = _mm256_setzero_ps();
+        for (; i + 8 <= I; i += 8)
+            acc = _mm256_fmadd_ps(bf16_decode8(row + i), _mm256_loadu_ps(x + i), acc);
+        sum = hsum256(acc);
+#endif
+        for (; i < I; i++) sum += bf16_to_f32(row[i]) * x[i];
+        y[o] = sum;
+    }
+}
+static void mvb(float *y, const WB *w, const float *x) {
+#ifdef COLI_VULKAN
+    if (vk_mul(11, w->w, NULL, w->O, w->I, y, w->O, x, w->I, 1)) return;
+    v41_dho_host(w->w);
+#endif
+    mvb_cpu(y, w, x);
+}
+/* mvb for `rows` positions: one call on the device (an S-row GEMM instead of a GEMV
+ * per position), the one-position kernel row by row on the CPU, so the CPU bits are
+ * mvb's. A prefill site that projected token by token calls this once instead. */
+static void mvb_rows(float *y, int ystride, const WB *w, const float *x, int xstride, int rows) {
+#ifdef COLI_VULKAN
+    if (vk_mul(11, w->w, NULL, w->O, w->I, y, ystride, x, xstride, rows)) return;
+    v41_dho_host(w->w);
+#endif
+    for (int r = 0; r < rows; r++) mvb_cpu(y + (size_t)r * ystride, w, x + (size_t)r * xstride);
+}
+
+/* ------------------------------------------------------------- engram ------ */
+
+/* One n-gram memory. The table itself never enters RAM: `lookup` reads the row it
+ * needs (head_dim bytes of e4m3 plus head_dim/32 scale bytes) and keeps it in a small
+ * LRU, because n-gram traffic is Zipfian -- the common 2-grams repeat constantly. */
+typedef struct {
+    int fd_w, fd_s;
+    int64_t off_w, off_s, rows;
+    /* row cache: open addressing on the row id, LRU by a clock */
+    int cap, mask;
+    int64_t *key;      /* row id, -1 for empty */
+    uint64_t *used;
+    float *value;      /* cap x head_dim */
+    uint64_t clock, hits, misses;
+} EngramTable;
+
+typedef struct {
+    int active;
+    int max_ngram, heads, head_dim, cols, pad_id;
+    int64_t primes[V41_MAX_ENGRAM][V41_MAX_NGRAM][V41_MAX_EHEADS];
+    int64_t offsets[V41_MAX_ENGRAM][V41_MAX_NGRAM * V41_MAX_EHEADS];
+    int64_t multipliers[V41_MAX_ENGRAM][V41_MAX_NGRAM];
+    int layer_of[V41_MAX_ENGRAM];
+    int n_layers;
+    int32_t *token_map;
+    int token_map_len;
+    EngramTable table[V41_MAX_ENGRAM];
+    /* compressed ids of every position seen so far: the n-gram of a position looks
+     * back over these, and an image position is DEAD (-1) so no n-gram spans it */
+    int32_t *history;
+    int history_len, history_cap;
+} Engram;
+
+#define ENGRAM_DEAD (-1)
+
+static void engram_load_sidecar(Engram *e, const char *snap) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/dsv41_engram.json", snap);
+    FILE *f = fopen(path, "rb");
+    if (!f) { e->active = 0; return; }   /* a text-only container without engram is legal */
+    fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
+    char *text = xmalloc((size_t)size + 1, "engram sidecar");
+    if (fread(text, 1, (size_t)size, f) != (size_t)size) {
+        fprintf(stderr, "[engram] short read on %s\n", path); exit(1); }
+    text[size] = 0; fclose(f);
+    char *arena = NULL;
+    jval *root = json_parse(text, &arena);
+    if (!root) { fprintf(stderr, "[engram] %s is not valid JSON\n", path); exit(1); }
+
+    e->max_ngram = (int)jnum(root, "max_ngram_size", 0);
+    e->heads     = (int)jnum(root, "n_heads", 0);
+    e->head_dim  = (int)jnum(root, "head_dim", 0);
+    e->pad_id    = (int)jnum(root, "pad_id", 0);
+    e->cols      = (e->max_ngram - 1) * e->heads;
+    if (e->max_ngram > V41_MAX_NGRAM || e->heads > V41_MAX_EHEADS) {
+        fprintf(stderr, "[engram] layout %dx%d exceeds the compiled maximum\n",
+                e->max_ngram, e->heads); exit(1); }
+    jval *ids = json_get(root, "layer_ids");
+    e->n_layers = ids && ids->t == J_ARR ? ids->len : 0;
+    if (e->n_layers > V41_MAX_ENGRAM) {
+        fprintf(stderr, "[engram] %d tables exceed the compiled maximum\n", e->n_layers); exit(1); }
+    for (int i = 0; i < e->n_layers; i++) e->layer_of[i] = (int)ids->kids[i]->num;
+    jval *primes = json_get(root, "primes");
+    jval *offsets = json_get(root, "offsets");
+    jval *multipliers = json_get(root, "multipliers");
+    if (!primes || !offsets || !multipliers) {
+        fprintf(stderr, "[engram] sidecar lacks primes/offsets/multipliers\n"); exit(1); }
+    /* SEC: the loop below indexes all three by table, up to the length of layer_ids --
+     * a different number, chosen by the same file. A shorter array was read past its
+     * end, and a key that is not an array has no kids at all. */
+    const jval *per_table[] = { primes, offsets, multipliers };
+    const char *per_table_name[] = { "primes", "offsets", "multipliers" };
+    for (int k = 0; k < 3; k++)
+        if (per_table[k]->t != J_ARR || per_table[k]->len < e->n_layers) {
+            fprintf(stderr, "[engram] %s must be an array with one entry per table (%d)\n",
+                    per_table_name[k], e->n_layers); exit(1); }
+    for (int layer = 0; layer < e->n_layers; layer++) {
+        jval *rows = primes->kids[layer];
+        for (int n = 0; n < rows->len && n < V41_MAX_NGRAM; n++)
+            for (int h = 0; h < rows->kids[n]->len && h < V41_MAX_EHEADS; h++)
+                e->primes[layer][n][h] = (int64_t)rows->kids[n]->kids[h]->num;
+        jval *off = offsets->kids[layer];
+        for (int i = 0; i < off->len && i < V41_MAX_NGRAM * V41_MAX_EHEADS; i++)
+            e->offsets[layer][i] = (int64_t)off->kids[i]->num;
+        jval *mult = multipliers->kids[layer];
+        for (int i = 0; i < mult->len && i < V41_MAX_NGRAM; i++) {
+            /* Decimal strings on purpose. The multipliers run to int64 / compressed
+             * vocabulary, which is past the 53 bits a double keeps exactly; read as a
+             * number, a rounded multiplier would hash every n-gram into a different --
+             * and perfectly valid-looking -- row. Refuse rather than round. */
+            jval *entry = mult->kids[i];
+            if (entry->t != J_STR) {
+                fprintf(stderr, "[engram] multipliers must be decimal strings; this "
+                                "sidecar stores them as JSON numbers, which cannot hold "
+                                "them exactly. Regenerate it with tools/prepare_dsv41.py\n");
+                exit(1);
+            }
+            errno = 0;
+            char *end = NULL;
+            long long value = strtoll(entry->str, &end, 10);
+            if (errno || !end || *end) {
+                fprintf(stderr, "[engram] multiplier %s is not an integer\n", entry->str);
+                exit(1);
+            }
+            e->multipliers[layer][i] = (int64_t)value;
+        }
+    }
+    jval *map = json_get(root, "token_map");
+    if (!map || map->t != J_ARR) { fprintf(stderr, "[engram] sidecar lacks token_map\n"); exit(1); }
+    e->token_map_len = map->len;
+    e->token_map = xmalloc((size_t)map->len * sizeof(int32_t), "engram token map");
+    for (int i = 0; i < map->len; i++) e->token_map[i] = (int32_t)map->kids[i]->num;
+    e->active = 1;
+    json_free(root); free(arena); free(text);
+}
+
+static void engram_table_open(EngramTable *t, shards *S, int layer, int head_dim, int cache_rows) {
+    char name[256];
+    snprintf(name, sizeof(name), "layers.%d.engram.embed.weight", layer);
+    st_tensor *w = st_find(S, name);
+    snprintf(name, sizeof(name), "layers.%d.engram.embed.scale", layer);
+    st_tensor *s = st_find(S, name);
+    if (!w || !s) { fprintf(stderr, "[engram] layer %d has no table\n", layer); exit(1); }
+    /* SEC: engram_row() reads row `id` at id * head_dim bytes into the table and at
+     * id * head_dim/32 into its scales. head_dim comes from the sidecar and the two
+     * sizes from the shards, and nothing held them together: a head_dim of 0 divided
+     * by zero below, one off a multiple of 32 left the tail of every cached row
+     * unwritten, and a scale tensor shorter than the table was read past its end. */
+    if (head_dim <= 0 || head_dim % 32) {
+        fprintf(stderr, "[engram] head_dim %d is not a positive multiple of 32\n", head_dim);
+        exit(1);
+    }
+    if (w->nbytes % head_dim || s->nbytes != w->nbytes / head_dim * (head_dim / 32)) {
+        fprintf(stderr, "[engram] layer %d: a table of %lld bytes and %lld scale bytes are "
+                        "not whole rows of %d bytes with one scale per 32\n", layer,
+                (long long)w->nbytes, (long long)s->nbytes, head_dim);
+        exit(1);
+    }
+    t->fd_w = w->fd; t->off_w = w->off;
+    t->fd_s = s->fd; t->off_s = s->off;
+    t->rows = w->nbytes / head_dim;
+    int cap = 1;
+    while (cap < cache_rows) cap <<= 1;
+    t->cap = cap; t->mask = cap - 1;
+    t->key = xmalloc((size_t)cap * sizeof(int64_t), "engram row keys");
+    t->used = xmalloc((size_t)cap * sizeof(uint64_t), "engram row clocks");
+    t->value = xmalloc((size_t)cap * head_dim * sizeof(float), "engram row cache");
+    for (int i = 0; i < cap; i++) { t->key[i] = -1; t->used[i] = 0; }
+    t->clock = t->hits = t->misses = 0;
+}
+
+/* The row for `id`, dequantized. Reads through a direct-mapped-with-probe cache: on a
+ * miss the row and its scales are one pread each, 264 bytes for the released table. */
+static const float *engram_row(EngramTable *t, int64_t id, int head_dim) {
+    int groups = head_dim / 32;
+    /* SEC: `id` is a hash bucket plus an offset, both from the sidecar; the row count
+     * is the shard's. An id past either end read whatever the file holds there, and
+     * -1 -- the empty-slot key -- "hit" an empty slot and returned a row never read.
+     * Checked before the probe for that reason. */
+    if (id < 0 || id >= t->rows) {
+        fprintf(stderr, "[engram] row %lld is outside the table (%lld rows): "
+                        "dsv41_engram.json does not describe this checkpoint\n",
+                (long long)id, (long long)t->rows);
+        exit(1);
+    }
+    int slot = (int)((uint64_t)(id * 0x9E3779B97F4A7C15ull) >> 40) & t->mask;
+    int victim = slot;
+    for (int probe = 0; probe < 4; probe++) {
+        int at = (slot + probe) & t->mask;
+        if (t->key[at] == id) { t->used[at] = ++t->clock; t->hits++;
+                                return t->value + (size_t)at * head_dim; }
+        if (t->key[at] == -1) { victim = at; goto fill; }
+        if (t->used[at] < t->used[victim]) victim = at;
+    }
+fill:
+    t->misses++;
+    {
+        uint8_t bytes[512], scales[64];
+        if (head_dim > (int)sizeof(bytes) || groups > (int)sizeof(scales)) {
+            fprintf(stderr, "[engram] head_dim %d exceeds the row buffer\n", head_dim); exit(1); }
+        st_pread_full(t->fd_w, bytes, head_dim, t->off_w + id * head_dim, "engram row");
+        st_pread_full(t->fd_s, scales, groups, t->off_s + id * groups, "engram scale");
+        float *out = t->value + (size_t)victim * head_dim;
+        for (int g = 0; g < groups; g++) {
+            float scale = ue8m0(scales[g]);
+            for (int i = 0; i < 32; i++) out[g * 32 + i] = e4m3_decode(bytes[g * 32 + i]) * scale;
+        }
+        t->key[victim] = id; t->used[victim] = ++t->clock;
+        return out;
+    }
+}
+
+/* engram.py NgramHashState: the ids of the n-grams ending at `pos`, for one table.
+ * `out` receives `cols` row ids. */
+static void engram_hash(const Engram *e, int table, int pos, int64_t *out) {
+    int64_t tokens[V41_MAX_NGRAM];
+    int blocked = 0;
+    for (int shift = 0; shift < e->max_ngram; shift++) {
+        int at = pos - shift;
+        int32_t source = at >= 0 ? e->history[at] : ENGRAM_DEAD;
+        if (at < 0 || source == ENGRAM_DEAD) blocked = 1;
+        tokens[shift] = blocked ? e->pad_id : source;
+    }
+    /* XOR the multiplied ids one lookback at a time: after step i the running value is
+     * the hash of the (i+1)-gram, and each lands in its own prime-sized bucket range.
+     * int64 throughout -- the multipliers are chosen so id * multiplier cannot wrap. */
+    int64_t rolling = tokens[0] * e->multipliers[table][0];
+    int col = 0;
+    for (int i = 1; i < e->max_ngram; i++) {
+        rolling ^= tokens[i] * e->multipliers[table][i];
+        for (int h = 0; h < e->heads; h++, col++) {
+            int64_t prime = e->primes[table][i - 1][h];
+            int64_t bucket = prime > 0 ? rolling % prime : 0;
+            if (bucket < 0) bucket += prime;          /* C99 truncates toward zero */
+            out[col] = bucket + e->offsets[table][col];
+        }
+    }
+}
+
+/* `image` may be NULL (all text) or one byte per token: an image position is DEAD, so
+ * no n-gram spans it -- model.py passes ~image_mask as the engram's token_mask for the
+ * same reason. */
+static void engram_push(Engram *e, const int *ids, int n, const uint8_t *image) {
+    if (e->history_len + n > e->history_cap) {
+        int cap = e->history_cap ? e->history_cap : 1024;
+        while (cap < e->history_len + n) cap *= 2;
+        e->history = realloc(e->history, (size_t)cap * sizeof(int32_t));
+        if (!e->history) { fprintf(stderr, "OOM growing the engram history\n"); exit(1); }
+        e->history_cap = cap;
+    }
+    for (int i = 0; i < n; i++) {
+        int id = ids[i];
+        int32_t compressed = ENGRAM_DEAD;
+        if (!(image && image[i]) && id >= 0 && id < e->token_map_len)
+            compressed = e->token_map[id];
+        e->history[e->history_len++] = compressed;
+    }
+}
+
+/* -------------------------------------------------------------- model ------ */
+
+/* Six tensors make one expert: three packed weight matrices and their three
+ * ue8m0 scale sidecars. expert_read_list emits them in this order and Slot
+ * stores one window per part, so both sides can agree through slot_part(). */
+#define V41_EXPERT_TENSORS 6
+
+/* One routed expert, resident in a cache slot. The three matrices keep the
+ * checkpoint's fp4 packing and their ue8m0 group scales: quant.h's matmul_mxfp4
+ * consumes exactly this, so nothing is unpacked on the way in. */
+typedef struct {
+    int eid;
+    uint8_t *w1, *w3, *w2;      /* packed nibbles */
+    uint8_t *s1, *s3, *s2;      /* ue8m0, one byte per 32-column group */
+    /* The window each of those six pointers was carved out of. A tensor sits at
+     * an arbitrary file offset, and the O_DIRECT path reads from the enclosing
+     * block boundary (st_read_range_rep takes the slack behind the destination
+     * for exactly this), so the bytes a slot serves begin some way into their
+     * window and the six pointers above are republished from these once the read
+     * lands. Only the read path needs the windows. */
+    uint8_t *base[V41_EXPERT_TENSORS];
+    uint64_t used;
+} Slot;
+
+/* The six buffers of a slot, in the order expert_read_list emits them. */
+static uint8_t **slot_part(Slot *s, int part) {
+    switch (part) {
+    case 0: return &s->w1;
+    case 1: return &s->s1;
+    case 2: return &s->w3;
+    case 3: return &s->s3;
+    case 4: return &s->w2;
+    default: return &s->s2;
+    }
+}
+
+typedef struct { Slot *slot; int n, cap; } LCache;
+
+typedef struct {
+    W8 wq_a, wq_b, wkv, wo_a, wo_b;
+    WF q_norm, kv_norm, attn_sink, attn_norm, ffn_norm;
+    WF hc_attn_fn, hc_ffn_fn, hc_attn_base, hc_ffn_base, hc_attn_scale, hc_ffn_scale;
+    WB comp_wkv, comp_wgate;
+    WF comp_norm;
+    W8 idx_wq_b;
+    WB idx_wk, idx_wproj;
+    WF idx_knorm;
+    WB gate_w;
+    WF gate_bias;
+    W8 sh_w1, sh_w3, sh_w2;
+    /* engram (only on engram layers) */
+    W8 eng_wkv;
+    WF eng_q, eng_k;
+    int engram_index;           /* which table, -1 when this layer has none */
+    /* per-layer state */
+    float *window;              /* [window_size, head_dim] ring of raw KV */
+    /* Which position each ring slot holds, -1 when it holds nothing yet. A single
+     * decode step needs only "slot i is position i until the ring wraps", but a
+     * speculative step writes several positions at once and then keeps only some of
+     * them: the slots of the rejected drafts still hold their keys, and the only thing
+     * that makes them unreadable is knowing which position they came from. */
+    int *window_pos;
+    float *ckv;                 /* [max_pos/ratio, head_dim] compressed KV (owners) */
+    float *ikey;                /* [max_pos/ratio, index_head_dim] index keys (owners) */
+    float *cstate_kv, *cstate_score;   /* compressor group still filling */
+    /* What a speculative step displaced, one entry per row of the batch: the ring slot
+     * it overwrote and the compressor slot it overwrote. Both are addressed modulo
+     * something (the window, the compression ratio), so a draft several positions ahead
+     * lands on a slot a committed position still needs -- the key one window back, or
+     * the earlier half of a group that has not closed yet. Rejected rows put these
+     * back. */
+    float *ring_save, *cstate_save_kv, *cstate_save_score;
+    int *ring_save_pos, *cstate_save_slot;
+} Layer;
+
+/* DSpark: the MTP draft head, under `mtp.*` in the checkpoint.
+ *
+ * Three stages of the same block the backbone uses, with three differences: the
+ * attention never compresses (it is window-only, and the window holds the MAIN
+ * stream's keys), the expert set is its own and smaller, and the last stage carries
+ * the heads that turn one hidden state into a block of guesses -- a Markov head that
+ * biases each position by the token before it, and a confidence head nobody has to
+ * trust, because the main model verifies every draft before a single one is emitted.
+ *
+ * The vendor ships the module and no loop: `forward_spec` exists, nothing calls it.
+ * The accept/reject loop here is therefore ours, and it is written to be exact rather
+ * than clever -- a token that comes out of a draft is the token the sequential decode
+ * would have produced, or it is not emitted. */
+typedef struct {
+    int active;                 /* the stages loaded                              */
+    Layer *stage;
+    LCache *cache;              /* one expert cache per stage, its own expert set  */
+    W8 main_proj;
+    WF main_norm, norm;
+    WB markov_embed, markov_out, conf_proj;
+    uint64_t proposed, accepted, rounds;
+    /* Drafting is not free: a round reads the stages' experts whether or not anything
+     * is accepted. When acceptance collapses -- a different domain, a long verbatim
+     * quote, anything the head has no signal on -- the drafts are pure disk tax, so
+     * they pause for a while and the guard re-measures. */
+    int pause, min_accept, max_verify;
+    uint64_t window_prop, window_acc;
+} Spec;
+
+typedef struct {
+    Cfg c;
+    shards S;
+    Engram engram;
+    Layer *L;
+    WB embed, head;
+    WF norm;
+    LCache *cache;
+    int ecap;                   /* expert slots per layer */
+    uint64_t clock, hits, miss;
+    double t_disk, t_expert, t_attn, t_engram, t_spec;
+    uint64_t forwards, expert_bytes;
+    /* rope tables: [max_pos, rope_dim/2] cos/sin pairs, one per theta in use */
+    float *rope_window, *rope_compress;
+    int pos;                    /* positions consumed so far */
+    /* candidate mask published by the candidate source layer, one row per query */
+    uint8_t *candidates;
+    int candidate_width, candidate_rows;
+    /* What an index source publishes for the layers after it (model.py's
+     * shared_attn.topk_idxs): the compressed positions each query keeps, already
+     * shifted by the window offset. A layer that compresses but does not index reads
+     * this instead of scoring again -- that is the whole point of index_source_layers
+     * being a subset. Persisting across forwards is deliberate, as in the vendor. */
+    int *shared_topk;
+    int shared_topk_rows, shared_topk_width;
+    /* The index keys an owner last published, and the layer that owns them.
+     *
+     * model.py keeps this in one global slot and republishes it only when a layer
+     * COMPLETES a compression group (`if self.owns_k and latent is not None`). On a
+     * decode step where a ratio-2 layer's group is still filling, that layer therefore
+     * scores its queries against whichever cache was published last -- in the released
+     * config, layer 20's, whose rows are ratio-1 latents and mean something else.
+     *
+     * That is the released behaviour and every published number for this model was
+     * produced with it, so it is what this engine reproduces by default and what the
+     * oracle in tools/dsv41_ref.py encodes. V41_INDEX_OWNER=1 selects the reading the
+     * architecture implies instead -- each layer against its own owner's keys -- which
+     * is a different model, not a bug fix, and is why it is not the default. */
+    const float *published_index_k;
+    int published_index_layer;
+    /* A speculative step runs several positions in one pass, and the slot above is
+     * per-STEP state in the vendor: to stay equal to the same positions decoded one at
+     * a time, each row has to read what was published as of its own position. These
+     * three hold the schedule -- which layer publishes at each sub-step, computed
+     * before the layers run because a layer AFTER this one still publishes BEFORE this
+     * one's later rows -- and the pointer the step began with. */
+    int *pub_layer;
+    int pub_rows;
+    const float *pub_before;
+    int pub_before_layer;
+    uint8_t **ehit;             /* experts routed this turn (dashboard HITS) */
+    struct Vision *vision;      /* the VL tower, NULL on a text-only container */
+    Spec spec;
+    /* the DSpark input the last forward produced: [rows, n_targets * dim] */
+    float *main_hidden;
+    int main_hidden_rows;
+    /* where the last forward started and how many of its rows survived it: a
+     * speculative step keeps only the prefix that verified, and the next draft has to
+     * seed the stages with exactly the positions that were committed */
+    int last_start, last_rows;
+    /* Whether THIS forward's rows may be rolled back, i.e. whether it is the
+     * speculative verify batch. The per-layer undo buffers (ring_save,
+     * cstate_save_*) are sized for one draft block and nothing else, because
+     * until prefix reuse existed a forward with many rows always started at
+     * position 0 and took the batched paths that write no undo at all. A
+     * prefill that resumes mid-sequence is many rows AND past position 0, so
+     * the guard cannot be `n > 1` any more: it has to be the reason the buffers
+     * exist. A prefill is never rolled back. */
+    int rollback_save;
+    /* What the state describes, so a turn that resends the transcript feeds only
+     * the new tail. Everything a turn builds here is position-indexed and
+     * append-only -- the window rings and their position map, the compressor's
+     * group slots and its partial group, the index keys, the engram history --
+     * so a state that stopped at position P IS the state at P. The one thing
+     * that is not described by a token id is an image: its placeholders carry
+     * the same id whatever the picture was, so consuming one taints the record
+     * (see kv_prefix.h). */
+    kv_prefix kvp;
+} Model;
+
+/* One conversation's state for a multiplexed serve (KV_SLOTS>1, serve_mux below):
+ * the per-layer arrays it owns and the cross-layer state attention_run reads from the
+ * Model (v41_seq_swap trades the two sets). */
+typedef struct {
+    float **window, **ckv, **ikey, **cstate_kv, **cstate_score;
+    int **window_pos;
+    int pos;
+    kv_prefix kvp;
+    int32_t *history; int history_len, history_cap;
+    const float *published_index_k; int published_index_layer;
+    int *shared_topk; int shared_topk_rows, shared_topk_width;
+    uint8_t *candidates; int candidate_width, candidate_rows;
+} V41Seq;
+static int g_v41_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
+
+/* ------------------------------------------------------------ rope --------- */
+
+static float rope_correction_dim(float rotations, int dim, float base, int max_seq) {
+    return dim * logf(max_seq / (rotations * 2.0f * (float)M_PI)) / (2.0f * logf(base));
+}
+
+/* model.py precompute_freqs_cis, YaRN included, materialized as cos/sin pairs. */
+static float *rope_table(int dim, int seqlen, int original_seq_len, float base,
+                         float factor, int beta_fast, int beta_slow) {
+    int half = dim / 2;
+    float *freqs = xmalloc((size_t)half * sizeof(float), "rope freqs");
+    for (int i = 0; i < half; i++)
+        freqs[i] = 1.0f / powf(base, (float)(2 * i) / (float)dim);
+    if (original_seq_len > 0 && seqlen > original_seq_len) {
+        float low = floorf(rope_correction_dim((float)beta_fast, dim, base, original_seq_len));
+        float high = ceilf(rope_correction_dim((float)beta_slow, dim, base, original_seq_len));
+        if (low < 0) low = 0;
+        if (high > dim - 1) high = dim - 1;
+        if (low == high) high += 0.001f;
+        for (int i = 0; i < half; i++) {
+            float ramp = ((float)i - low) / (high - low);
+            if (ramp < 0) ramp = 0;
+            if (ramp > 1) ramp = 1;
+            float smooth = 1.0f - ramp;
+            freqs[i] = freqs[i] / factor * (1.0f - smooth) + freqs[i] * smooth;
+        }
+    }
+    float *table = xmalloc((size_t)seqlen * half * 2 * sizeof(float), "rope table");
+    for (int pos = 0; pos < seqlen; pos++)
+        for (int i = 0; i < half; i++) {
+            float angle = (float)pos * freqs[i];
+            table[((size_t)pos * half + i) * 2 + 0] = cosf(angle);
+            table[((size_t)pos * half + i) * 2 + 1] = sinf(angle);
+        }
+    free(freqs);
+    return table;
+}
+
+/* Rotate the trailing `rope_dim` entries of `v` in place, as pairs. `inverse` undoes
+ * the rotation, which the output projection needs. */
+static void rope_apply(float *v, const float *table, int pos, int rope_dim, int inverse) {
+    int half = rope_dim / 2;
+    const float *row = table + (size_t)pos * half * 2;
+    for (int i = 0; i < half; i++) {
+        float cosine = row[i * 2 + 0], sine = row[i * 2 + 1];
+        if (inverse) sine = -sine;
+        float a = v[2 * i], b = v[2 * i + 1];
+        v[2 * i]     = a * cosine - b * sine;
+        v[2 * i + 1] = a * sine   + b * cosine;
+    }
+}
+
+static void rms_into(float *out, const float *x, const float *weight, int n, float eps) {
+    double square = 0.0;
+    for (int i = 0; i < n; i++) square += (double)x[i] * x[i];
+    float inverse = 1.0f / sqrtf((float)(square / n) + eps);
+    for (int i = 0; i < n; i++) out[i] = weight[i] * x[i] * inverse;
+}
+
+/* --------------------------------------------------------- expert cache ---- */
+
+/* ---- which drive answers for an expert (multi-SSD mirror) ----------------
+ * An expert is what this engine streams: 88.5 GB of them for a 26-token turn on
+ * the released checkpoint, so where those bytes come from is most of the engine.
+ * Two things move them that the sibling engines already have and this one did
+ * not:
+ *
+ *   - COLI_MODEL_MIRROR=<dir>[;<dir>...] registers read-only copies of the
+ *     checkpoint on other drives. st_mirror_add above accepts a copy only when
+ *     its size and safetensors header are byte-identical to the primary's, so
+ *     every data offset matches by construction and each expert can be served
+ *     by any replica. A partial mirror is legal and a shard it does not carry
+ *     simply stays on the primary.
+ *   - the split between replicas follows COLI_DISK_WEIGHTS, or is measured at
+ *     startup with this engine's own access pattern when that is absent.
+ *
+ * Two independent drives answer in parallel; one drive split two ways answers no
+ * faster than itself, which is why the split is a measurement and not an
+ * assumption. */
+#define V41_MIR_REPS (1 + ST_MAX_MIR)
+
+static int g_mirror = 0;                 /* 1 = at least one replica accepted */
+static int g_mir_nrep = 1;               /* replicas incl. the primary */
+static int g_mir_cut[V41_MIR_REPS] = {256};   /* cumulative hash cuts of 256 */
+static int g_mir_epl = 384;              /* experts per layer, for the hash */
+static uint64_t g_mir_bytes[V41_MIR_REPS];
+static uint64_t g_mir_nread[V41_MIR_REPS];
+
+/* Replica of one expert. Deterministic: the hash depends on nothing but the
+ * expert's identity, so the same expert always lands on the same drive and a
+ * drive never caches a copy the next read will not ask it for.
+ *
+ * Over the FLAT index, not the two ids apart: deepseek_v4.c records why. An XOR
+ * of layer and eid spread the full 43x256 grid evenly but clustered the twelve
+ * or so experts a decode step actually touches onto one replica; multiplying the
+ * flat index by the golden-ratio constant and taking bits 16..23 inherits the
+ * uniformity of that index, so hot and cold subsets split alike. */
+static inline int expert_route(int layer, int eid) {
+    if (!g_mirror) return 0;
+    uint32_t h = (uint32_t)(layer * g_mir_epl + eid) * 2654435761u;
+    int hv = (int)((h >> 16) & 255), r = 0;
+    while (hv >= g_mir_cut[r]) r++;      /* cut[nrep-1]==256 terminates the scan */
+    return r;
+}
+
+/* Measure one replica's read bandwidth. Uses the engine's own pattern -- the
+ * depth the expert reader uses, and the O_DIRECT twin when there is one -- over
+ * `V41_MIR_PROBE_BLOCKS` blocks of V41_MIR_PROBE_BYTES spread across the largest
+ * shard the replica carries. The probe exists only to weight a split; reading
+ * through the page cache here would weigh the cache instead of the drive, so it
+ * says so when it cannot avoid it. */
+#define V41_MIR_PROBE_BYTES (19 << 20)
+#define V41_MIR_PROBE_BLOCKS 8
+
+static double mirror_probe_bw(shards *S, int rep) {
+    int big = -1;
+    int64_t bsz = 0;
+    for (int i = 0; i < S->nfd; i++) {
+        int fd = st_fd_rep(S, S->fds[i], rep);
+        if (fd < 0) continue;
+        int64_t sz = lseek(fd, 0, SEEK_END);
+        if (sz > bsz) { bsz = sz; big = i; }
+    }
+    const int64_t blk = V41_MIR_PROBE_BYTES;
+    if (big < 0 || bsz < blk * (V41_MIR_PROBE_BLOCKS + 1)) return 0;
+    int dfd = st_direct_fd_rep(S, S->fds[big], rep);
+    int fd = dfd >= 0 ? dfd : st_fd_rep(S, S->fds[big], rep);
+    if (fd < 0) return 0;
+    double t0 = now_s();
+    int64_t total = 0;
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(dynamic, 1) reduction(+:total)
+#endif
+    for (int i = 0; i < V41_MIR_PROBE_BLOCKS; i++) {
+        void *buf = NULL;
+        if (posix_memalign(&buf, ST_DIRECT_ALIGN, (size_t)blk) != 0) continue;
+        int64_t off = (((bsz - blk) / V41_MIR_PROBE_BLOCKS) * i) & ~(int64_t)(4096 - 1);
+        ssize_t r = pread(fd, buf, (size_t)blk, off);
+        if (r > 0) total += r;
+        compat_aligned_free(buf);
+    }
+    double dt = now_s() - t0;
+    return (dt > 0 && total > 0) ? (double)total / 1e9 / dt : 0;
+}
+
+/* Register the replicas and derive the split. Runs after the shard index is
+ * open and before the first expert read, so nothing is already cached from the
+ * primary by the time the split exists. */
+static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer) {
+    if (experts_per_layer > 0) g_mir_epl = experts_per_layer;
+    const char *dirs = getenv("COLI_MODEL_MIRROR");
+    if (!dirs || !*dirs) dirs = getenv("SNAP_MIRROR");
+    if (!dirs || !*dirs) return;
+    st_mirror_reset(S);
+    int nrep = 1;
+    char buf[4096];
+    snprintf(buf, sizeof(buf), "%s", dirs);
+    for (char *p = buf; p && *p; ) {
+        char *sep = p;
+        while (*sep && *sep != ';' && *sep != ',') sep++;
+        int last = (*sep == 0);
+        *sep = 0;
+        while (*p == ' ') p++;
+        size_t len = strlen(p);
+        while (len > 0 && p[len - 1] == ' ') p[--len] = 0;
+        if (*p) {
+            if (model_dir && !strcmp(model_dir, p))
+                fprintf(stderr, "[MIRROR] %s equals the model dir — ignored\n", p);
+            else if (nrep >= V41_MIR_REPS)
+                fprintf(stderr, "[MIRROR] %s: too many mirrors (max %d) — ignored\n", p, ST_MAX_MIR);
+            else {
+                int nf = st_mirror_add(S, p);
+                if (nf <= 0)
+                    fprintf(stderr, "[MIRROR] %s: no usable shard (missing or divergent "
+                                    "copy) — skipped\n", p);
+                else {
+                    fprintf(stderr, "[MIRROR] %s: %d/%d shards (replica %d)\n",
+                            p, nf, S->nfd, nrep);
+                    nrep++;
+                }
+            }
+        }
+        p = last ? NULL : sep + 1;
+    }
+    if (nrep < 2) {
+        fprintf(stderr, "[MIRROR] no usable mirror — reading the primary drive only\n");
+        return;
+    }
+    g_mirror = 1; g_mir_nrep = nrep;
+    double weight[V41_MIR_REPS];
+    int have = 0;
+    const char *spec = getenv("COLI_DISK_WEIGHTS");
+    const char *how = "COLI_DISK_WEIGHTS";
+    if (spec && *spec) {
+        char wb[256];
+        snprintf(wb, sizeof(wb), "%s", spec);
+        int n = 0, bad = 0;
+        for (char *tok = strtok(wb, ", "); tok; tok = strtok(NULL, ", ")) {
+            double v = atof(tok);
+            if (v <= 0 || n >= V41_MIR_REPS) { bad = 1; break; }
+            weight[n++] = v;
+        }
+        if (!bad && n == nrep) have = 1;
+        else
+            fprintf(stderr, "[MIRROR] invalid COLI_DISK_WEIGHTS '%s' (want %d positive "
+                            "comma-separated weights, e.g. 9,3) — probing instead\n", spec, nrep);
+    }
+    if (!have) {
+        how = "measured";
+        have = 1;
+        for (int r = 0; r < nrep; r++) {
+            weight[r] = mirror_probe_bw(S, r);
+            if (weight[r] <= 0) have = 0;
+        }
+        if (have) {
+            fprintf(stderr, "[MIRROR] probe:");
+            for (int r = 0; r < nrep; r++)
+                fprintf(stderr, "%s %s %.2f GB/s", r ? " |" : "",
+                        r ? "mirror" : "primary", weight[r]);
+            fprintf(stderr, "\n");
+        } else {
+            for (int r = 0; r < nrep; r++) weight[r] = 1;
+            how = "fallback 1:1 (probe failed)";
+        }
+    }
+    double sum = 0;
+    for (int r = 0; r < nrep; r++) sum += weight[r];
+    int acc = 0;
+    double cum = 0;
+    for (int r = 0; r < nrep; r++) {
+        cum += weight[r];
+        int cut = (int)(256.0 * cum / sum + 0.5);
+        if (cut <= acc) cut = acc + 1;
+        if (cut > 256) cut = 256;
+        g_mir_cut[r] = cut;
+        acc = cut;
+    }
+    fprintf(stderr, "[MIRROR] %d replicas, split %s:", nrep, how);
+    for (int r = 0; r < nrep; r++) {
+        int share = (r ? g_mir_cut[r] : g_mir_cut[0]) - (r ? g_mir_cut[r - 1] : 0);
+        fprintf(stderr, " %s %d%%", r ? "mirror" : "primary", (share * 100 + 128) / 256);
+    }
+    fprintf(stderr, "\n");
+}
+
+/* The per-drive line ENVIRONMENT.md documents ("Per-drive byte counts are
+ * reported in a MIRROR: stats line"), in the shape colibri.c prints. Counters
+ * are cumulative; passing the values from before a turn reports that turn. On
+ * stderr, because stdout carries the serve protocol. */
+static void mirror_report(const uint64_t *bytes0, const uint64_t *reads0) {
+    if (!g_mirror) return;
+    double per[V41_MIR_REPS], total = 0;
+    for (int r = 0; r < g_mir_nrep; r++) {
+        uint64_t bytes = g_mir_bytes[r] - (bytes0 ? bytes0[r] : 0);
+        per[r] = (double)bytes / 1e9;
+        total += per[r];
+    }
+    fprintf(stderr, "MIRROR: primary %.2f GB (%llu reads)", per[0],
+            (unsigned long long)(g_mir_nread[0] - (reads0 ? reads0[0] : 0)));
+    for (int r = 1; r < g_mir_nrep; r++)
+        fprintf(stderr, " | mirror%d %.2f GB (%llu reads)", r, per[r],
+                (unsigned long long)(g_mir_nread[r] - (reads0 ? reads0[r] : 0)));
+    fprintf(stderr, " — %.0f%% of expert bytes from the mirrors\n",
+            total > 0 ? 100.0 * (total - per[0]) / total : 0.0);
+}
+
+/* One tensor still to fetch: which tensor, which window it lands in, and which
+ * replica answers for it. An expert is six of these -- three weight matrices and
+ * their three scale sidecars. */
+typedef struct {
+    const st_tensor *t;   /* resolved once, so a read is a pread and not a hash lookup */
+    Slot *slot;           /* whose window, and which of the six, to republish after */
+    int part;
+    int rep;
+} ExpertRead;
+
+/* Bytes one part of an expert occupies, from the config rather than the file:
+ * this is the capacity the slot's window was sized for, and the reader refuses a
+ * tensor that declares more than that (see expert_fetch). */
+static int64_t expert_part_bytes(const Cfg *c, int part) {
+    switch (part) {
+    case 0: case 2: return (int64_t)c->moe_inter * c->dim / 2;        /* w1, w3 */
+    case 1: case 3: return (int64_t)c->moe_inter * (c->dim / 32);     /* their scales */
+    case 4: return (int64_t)c->dim * c->moe_inter / 2;                /* w2 */
+    default: return (int64_t)c->dim * (c->moe_inter / 32);            /* its scale */
+    }
+}
+
+/* Fill in the six reads that make up one expert. Naming them into a list instead
+ * of reading them on the spot is the whole point: the list is what lets a layer's
+ * misses go to the device together rather than one behind another. Resolution
+ * happens here too, once per miss, so the read itself is a pread through the
+ * chosen replica's fd rather than a name lookup followed by a primary-drive one. */
+static int expert_read_list(Model *m, const char *kind, int layer, int eid, Slot *s,
+                            int rep, ExpertRead *out) {
+    static const struct { const char *suffix; int weight_part, scale_part; } part[3] = {
+        { "w1", 0, 1 }, { "w3", 2, 3 }, { "w2", 4, 5 },
+    };
+    static const char *const leaf[2] = { "weight", "scale" };
+    char name[160];
+    int n = 0;
+    for (int i = 0; i < 3; i++) {
+        for (int f = 0; f < 2; f++) {
+            snprintf(name, sizeof(name), "%s.%d.ffn.experts.%d.%s.%s",
+                     kind, layer, eid, part[i].suffix, leaf[f]);
+            const st_tensor *t = st_find(&m->S, name);
+            if (!t) st_die_missing(&m->S, name);
+            out[n].t = t;
+            out[n].slot = s;
+            out[n].part = f ? part[i].scale_part : part[i].weight_part;
+            out[n].rep = rep;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* How many expert tensors to keep in flight. One at a time is what the engine did
+ * and it leaves most of the device on the floor: measured on the released
+ * checkpoint, 88.5 GB of expert reads landed at 2.40 GB/s, while the same blocks
+ * through the same page cache go at 6.2 GB/s with one reader and 12.6 GB/s with
+ * four (c/iobench.c, 5.6 MB blocks, caches dropped). A striped NVMe pair answers
+ * several requests at once; a single blocking pread never asks it to.
+ * V41_READ_DEPTH=1 restores the serial path for an A/B. */
+static int expert_read_depth(void) {
+    static int depth = -1;
+    if (depth < 0) {
+        const char *env = getenv("V41_READ_DEPTH");
+        depth = env ? atoi(env) : 8;
+        if (depth < 1) depth = 1;
+    }
+    return depth;
+}
+
+/* O_DIRECT for the expert reads. On by default, as in the V4 engine, because of
+ * what an expert read is: each is read once and wanted no longer, the engine
+ * tells the kernel so afterwards (drop=1 -> POSIX_FADV_DONTNEED), and a buffered
+ * read of it therefore pays for the bytes twice -- once into the page cache and
+ * once out of it -- to leave the cache exactly as cold as it was. V41_DIRECT=0
+ * restores the buffered path, which is the arm of the A/B and the escape hatch
+ * on a device where the direct path turns out to be slower. */
+/* COLI_KV_PREFIX: on this engine reuse is OPT-IN, which it is on no other.
+ *
+ * Everywhere else a reused prefix is the same computation as a cold prefill, so
+ * reuse changes the time and nothing else and can be on by default. Here it is
+ * not, and the reason is the vendor's, not ours: a query reads one set of index
+ * keys when its position is prefilled (its layer's own index owner, masked to
+ * the query's reach) and another when the position is decoded (whatever was
+ * published last). Both are load-bearing -- giving the prefill the decode
+ * schedule drops the tiny oracle to 7/8, giving the decode the prefill owner
+ * drops it to 1/8 -- so a position that was generated in an earlier turn does
+ * not attend the way the same text attends when prefilled cold.
+ *
+ * What that costs: a conversation resumed from its own state and the same
+ * conversation re-read from scratch can answer differently. The resumed state is
+ * the sequential one, so it is not the wrong answer; it is a different one, and
+ * on a 510 GB model it arrives in seconds instead of minutes. That is a trade
+ * the person running the engine should make, so it is asked for rather than
+ * assumed. A resumed PREFILL is exact (docs/deepseek-v41.md records the split
+ * measurements), so a prompt that only ever grows without generated text in
+ * between -- an agent resending a document, a tool loop -- reuses losslessly. */
+static int kv_prefix_on(void){ const char *e = getenv("COLI_KV_PREFIX"); return e && *e != '0'; }
+
+static int expert_direct(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("V41_DIRECT") ? atoi(getenv("V41_DIRECT")) : 1;
+    return on != 0;
+}
+
+/* Read `n` reserved experts at once. The slot ids are stamped only after every
+ * read has landed, so a slot never advertises an expert it does not yet hold. */
+static void expert_fetch(Model *m, const char *kind, int layer,
+                         Slot *const *slot, const int *eid, int n) {
+    if (n <= 0) return;
+    int total = 0;
+    ExpertRead *list = xmalloc((size_t)n * V41_EXPERT_TENSORS * sizeof(ExpertRead),
+                               "expert read list");
+    for (int i = 0; i < n; i++)
+        total += expert_read_list(m, kind, layer, eid[i], slot[i],
+                                  expert_route(layer, eid[i]), list + total);
+    /* The window is sized from the config, so a container whose tensor declares
+     * more than that must not be read into it -- same refusal st_read_raw_cap
+     * applied when the read went by name. */
+    for (int i = 0; i < total; i++) {
+        int64_t cap = expert_part_bytes(&m->c, list[i].part);
+        if (list[i].t->nbytes < 0 || list[i].t->nbytes > cap) {
+            fprintf(stderr, "%s: expert tensor declares %lld bytes, the slot holds %lld — "
+                            "refusing (untrusted container)\n", list[i].t->name,
+                    (long long)list[i].t->nbytes, (long long)cap);
+            exit(1);
+        }
+    }
+    double started = now_s();
+    int threads = expert_read_depth();
+    if (threads > total) threads = total;
+    uint64_t bytes = 0;
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(threads) reduction(+:bytes)
+#endif
+    for (int i = 0; i < total; i++) {
+        const ExpertRead *r = &list[i];
+        int64_t pad = r->t->off % ST_DIRECT_ALIGN;
+        /* The payload pointer carries the slack st_read_range_rep needs to read
+         * from the enclosing block boundary, so an O_DIRECT transfer lands the
+         * data exactly where the slot wants it and nothing is copied afterwards. */
+        st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes,
+                          r->slot->base[r->part] + pad, r->t->nbytes, 1, expert_direct(),
+                          "pread expert");
+        /* Which drive actually answered. A partial mirror leaves shards on the
+         * primary, so the replica the route picked is not always the one that read. */
+        int rep = r->rep;
+        if (st_fd_rep(&m->S, r->t->fd, rep) < 0) rep = 0;
+        __atomic_fetch_add(&g_mir_bytes[rep], (uint64_t)r->t->nbytes, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
+        bytes += (uint64_t)r->t->nbytes;
+    }
+    /* Publish the payload pointers only now. A slot that advertises an expert has
+     * to address that expert, and until the read landed the window base was the
+     * only pointer that meant anything. */
+    for (int i = 0; i < total; i++)
+        *slot_part(list[i].slot, list[i].part) =
+            list[i].slot->base[list[i].part] + (list[i].t->off % ST_DIRECT_ALIGN);
+    m->expert_bytes += bytes;
+    m->t_disk += now_s() - started;
+    for (int i = 0; i < n; i++) slot[i]->eid = eid[i];
+    free(list);
+}
+
+/* One byte per expert: routed in this turn or not, for the dashboard's HITS line. */
+static pthread_mutex_t g_ehit_mx = PTHREAD_MUTEX_INITIALIZER;
+static void ehit_mark(Model *m, int layer, int eid) {
+    Cfg *c = &m->c;
+    /* Built privately and published once under a lock, the shape #1423 gave the
+     * other engines: a first touch from inside a parallel region otherwise
+     * publishes the outer array while the rows are still being filled, and a
+     * sibling thread dereferences a NULL row. Nothing here routes from a
+     * parallel region today, but the code is the same code, and the lock costs
+     * one atomic load on the path that matters. */
+    uint8_t **ehit = __atomic_load_n(&m->ehit, __ATOMIC_ACQUIRE);
+    if (!ehit) {
+        pthread_mutex_lock(&g_ehit_mx);
+        ehit = m->ehit;
+        if (!ehit) {
+            ehit = xmalloc((size_t)c->n_layers * sizeof(uint8_t *), "expert hit map");
+            for (int i = 0; i < c->n_layers; i++) {
+                ehit[i] = xmalloc((size_t)c->n_routed, "expert hit row");
+                memset(ehit[i], 0, (size_t)c->n_routed);
+            }
+            __atomic_store_n(&m->ehit, ehit, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&g_ehit_mx);
+    }
+    if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_routed) ehit[layer][eid] = 1;
+}
+
+/* `kind` is the checkpoint namespace, "layers" for the backbone and "mtp" for a
+ * DSpark stage: same slot shapes, same LRU, a different set of experts. Only the
+ * backbone's routing reaches the dashboard's grid -- the draft head has its own,
+ * smaller expert set, and a row of it would not line up with anything. */
+/* The Vulkan tier's index of a MoE call's layer: a backbone layer's own, a DSpark
+ * stage's n_layers + stage (the tier's extra layers, COLI_VK_TIER_MTP; a stage the tier
+ * did not take answers no to everything there). */
+static int v41_tier_layer(const Model *m, const char *kind, int layer) {
+    return !strcmp(kind, "layers") ? layer : m->c.n_layers + layer;
+}
+/* The slot a full cache gives up: the least recently used, and before it the least
+ * recently used of those whose expert the Vulkan tier holds (vkt_ram_first). */
+static int v41_victim(const Model *m, const LCache *cache, const char *kind, int layer) {
+    int oldest = 0, dev = -1, tl = v41_tier_layer(m, kind, layer);
+    for (int i = 1; i < cache->n; i++)
+        if (cache->slot[i].used < cache->slot[oldest].used) oldest = i;
+    for (int i = 0; i < cache->n; i++)
+        if (cache->slot[i].eid >= 0 && vkt_ram_first(tl, cache->slot[i].eid) &&
+            (dev < 0 || cache->slot[i].used < cache->slot[dev].used)) dev = i;
+    if (dev >= 0) { vkt_ram_gave(); return dev; }
+    return oldest;
+}
+static Slot *expert_slot_at(Model *m, LCache *cache, const char *kind, int layer, int eid) {
+    if (!strcmp(kind, "layers")) ehit_mark(m, layer, eid);
+    for (int i = 0; i < cache->n; i++)
+        if (cache->slot[i].eid == eid) {
+            cache->slot[i].used = ++m->clock;
+            m->hits++;
+            return &cache->slot[i];
+        }
+    m->miss++;
+    Slot *victim;
+    if (cache->n < cache->cap) {
+        victim = &cache->slot[cache->n++];
+    } else {
+        victim = &cache->slot[v41_victim(m, cache, kind, layer)];
+    }
+    victim->used = ++m->clock;
+    expert_fetch(m, kind, layer, &victim, &eid, 1);
+    return victim;
+}
+
+/* Resolve a whole step's routed experts to slots WITHOUT reading any of them, then
+ * fetch the misses in one batch. Reserving first is what makes the batch possible:
+ * a reserved victim is stamped with the newest clock and its id cleared, so a later
+ * reservation in the same step neither evicts it again nor mistakes it for a hit.
+ *
+ * The argument holds only while the cache has room for the whole step (cap >= topk):
+ * at reservation k at most k slots have been touched, so with cap > k there is
+ * always an untouched one left to evict, and the untouched ones are exactly the
+ * ones with an older clock. A cache smaller than topk has no such slot -- the
+ * caller keeps the one-at-a-time path for that case. */
+static void expert_slots_at(Model *m, LCache *cache, const char *kind, int layer,
+                            const int *chosen, int topk, Slot **out) {
+    int miss_eid[64];
+    Slot *miss_slot[64];
+    int misses = 0;
+    for (int k = 0; k < topk; k++) {
+        int eid = chosen[k];
+        if (!strcmp(kind, "layers")) ehit_mark(m, layer, eid);
+        Slot *found = NULL;
+        for (int i = 0; i < cache->n; i++)
+            if (cache->slot[i].eid == eid) { found = &cache->slot[i]; break; }
+        if (found) {
+            found->used = ++m->clock;
+            m->hits++;
+            out[k] = found;
+            continue;
+        }
+        m->miss++;
+        Slot *victim;
+        if (cache->n < cache->cap) {
+            victim = &cache->slot[cache->n++];
+        } else {
+            victim = &cache->slot[v41_victim(m, cache, kind, layer)];
+        }
+        victim->used = ++m->clock;
+        victim->eid = -1;                  /* not this expert yet: the read is still pending */
+        out[k] = victim;
+        miss_slot[misses] = victim;
+        miss_eid[misses] = eid;
+        misses++;
+    }
+    expert_fetch(m, kind, layer, miss_slot, miss_eid, misses);
+}
+
+/* ------------------------------------------------------------- loading ----- */
+
+typedef struct {
+    WF norm1, norm2, qkv_b, o_b;
+    WB qkv_w, o_w, w1, w2;
+} VisionBlock;
+
+typedef struct Vision {
+    int active;
+    WB proj_w; WF proj_b;
+    VisionBlock *block;
+    WF norm;
+    WB align_w1, align_w2;
+    WF align_b1, align_b2;
+    WF image_start, image_end, image_newline;
+} Vision;
+
+static void vision_load(Model *m, Vision *v);
+static void vision_forward(Model *m, Vision *v, const float *patches, int n_h, int n_w, float *out);
+static int vision_tokens(const Cfg *c, int n_h, int n_w);
+static void spec_load(Model *m, int ecap);
+
+/* One layer's expert cache. The DSpark stages route over their own, smaller expert set
+ * but the experts themselves are the same shape, so the slots are too. */
+static void cache_init(Model *m, LCache *cache, int ecap) {
+    Cfg *c = &m->c;
+    cache->cap = ecap; cache->n = 0;
+    cache->slot = xmalloc((size_t)ecap * sizeof(Slot), "expert slots");
+    for (int k = 0; k < ecap; k++) {
+        Slot *s = &cache->slot[k];
+        s->eid = -1; s->used = 0;
+        /* One window per tensor, page-aligned and with ST_DIRECT_ALIGN of slack
+         * past its payload. The slack is not padding for its own sake: it is what
+         * lets st_read_range_rep turn an unaligned safetensors range into one
+         * aligned O_DIRECT pread, instead of bouncing every expert through a
+         * scratch buffer and copying it again (see the expert reader). */
+        for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
+            size_t bytes = (size_t)expert_part_bytes(c, part) + ST_DIRECT_ALIGN;
+            void *window = NULL;
+            if (posix_memalign(&window, ST_DIRECT_ALIGN, bytes) != 0) {
+                fprintf(stderr, "OOM allocating expert window (%zu bytes)\n", bytes);
+                exit(1);
+            }
+            s->base[part] = window;
+            *slot_part(s, part) = window;   /* until the first read republishes it */
+        }
+    }
+}
+
+static void attn_project_check(const Cfg *c);
+
+#ifdef COLI_VULKAN
+static int v41c_decide(Model *m);   /* deepseek_v41_chain.h: COLI_VK_CHAIN, decided once */
+static int v41c_fit_now(Model *m);  /* deepseek_v41_chain.h: how many layers the chain places, once */
+static void v41c_fit_recount(Model *m);
+static int v41c_prepare(Model *m);
+static int v41c_build_layer(Model *m, int i, const char **why);
+static void v41c_cut_layer(Model *m, int i, const char *why);
+/* What the device would hold alone: the trunk matrices model_load reads into mappings,
+ * of the first `layers` layers (a partial chain's; every layer otherwise). */
+static size_t v41_dho_bytes(Model *m, int layers) {
+    const Cfg *c = &m->c;
+    char name[256];
+    size_t total = 0;
+    #define B(...) do { snprintf(name, sizeof name, __VA_ARGS__); st_tensor *t = st_find(&m->S, name); \
+                        if (t && t->nbytes > 0) total += (size_t)t->nbytes; } while (0)
+    for (int i = 0; i < c->n_layers && i < layers; i++) {
+        B("layers.%d.attn.wq_a.weight", i); B("layers.%d.attn.wq_b.weight", i); B("layers.%d.attn.wkv.weight", i);
+        B("layers.%d.attn.wo_a.weight", i); B("layers.%d.attn.wo_b.weight", i);
+        B("layers.%d.ffn.shared_experts.w1.weight", i); B("layers.%d.ffn.shared_experts.w3.weight", i);
+        B("layers.%d.ffn.shared_experts.w2.weight", i);
+        if (c->kv_source[i]) {
+            B("layers.%d.attn.compressor.wkv.weight", i);
+            if (c->compress_ratio[i] > 1) B("layers.%d.attn.compressor.wgate.weight", i);
+            B("layers.%d.attn.indexer.wk.weight", i);
+        }
+        if (c->index_source[i]) { B("layers.%d.attn.indexer.wq_b.weight", i); B("layers.%d.attn.indexer.weights_proj.weight", i); }
+    }
+    for (int t = 0; m->engram.active && t < m->engram.n_layers; t++)
+        if (m->engram.layer_of[t] < layers) B("layers.%d.engram.wkv.weight", m->engram.layer_of[t]);
+    #undef B
+    return total;
+}
+/* The layers whose matrices go to the device (the chain's first N with a partial chain),
+ * and whether the dense part is on the device at all (N = 0: the chain is off and, the fit
+ * being partial, the per-matrix path uploads nothing either). */
+static int v41_dense_layers(Model *m) { return g_v41_fit.L > 0 ? g_v41_fit.n : m->c.n_layers; }
+static int v41_dense_on(Model *m, int chain) {
+    if (g_v41_fit.L > 0) return g_v41_fit.n > 0 || (coli_vk_dense() && !g_v41_partial);
+    return chain != 0 || coli_vk_dense();
+}
+/* Before the layers are read: the device, the chain's decision, how many layers it
+ * places, and whether the trunk lives on the device only. COLI_VK_DENSE_HOST=1 (kept)
+ * opens the device after the weights, as before. */
+static void v41_dho_open(Model *m) {
+    const char *on = getenv("COLI_VULKAN"), *keep = getenv("COLI_VK_DENSE_HOST");
+    if (!on || !atoi(on) || (keep && *keep && atoi(keep) != 0)) return;
+    g_vk_opened = 1;
+    g_vk_thread = pthread_self();
+    g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && m->c.n_routed > 0);
+    if (!g_vk_ready) return;
+    int chain = v41c_decide(m);
+    g_v41_dho_try = 1;
+    v41c_fit_now(m);   /* before any upload: the first N layers (all when everything fits) */
+    int layers = v41_dense_layers(m);
+    g_v41_dho = coli_vk_dense_host_decide("deepseek_v41", v41_dense_on(m, chain), v41_dho_bytes(m, layers));
+    if (g_v41_fit.L > 0) coli_vk_dense_host_layers(layers, m->c.n_layers);
+    if (!g_v41_dho) v41c_fit_recount(m);   /* the chain's own set goes up after all */
+    g_v41_dho_layers = layers;
+    g_v41_shards = &m->S;
+    v41c_prepare(m);   /* the chain's layers built whole as they are read */
+}
+/* One matrix up as a lookup will ask for it, marked as held by the device alone. */
+static int v41_dho_up(const void *q, const uint8_t *tiles, int fmt, int O, int I) {
+    VkEntry *e = vk_entry(q, fmt, O, I);
+    if (!e || e->refused) return 0;
+    if (!e->t) {
+        float *scales = NULL;
+        if (fmt == 12) {
+            int groups = (I + FP8_TILE - 1) / FP8_TILE;
+            if (!(scales = malloc((size_t)O * groups * sizeof(float)))) return 0;
+            for (int o = 0; o < O; o++)
+                for (int g = 0; g < groups; g++) scales[(size_t)o * groups + g] = ue8m0(tiles[(size_t)(o / FP8_TILE) * groups + g]);
+        }
+        int ok = coli_vk_tensor_ensure(&e->t, q, scales, fmt, I, O, fmt == 12 ? FP8_TILE : 0);
+        free(scales);
+        if (!ok) return 0;
+    }
+    e->dho = 1;
+    return 1;
+}
+/* Every device copy of the bytes [base, base + bytes) freed (a matrix and the views
+ * inside it, such as wo_a's groups), their entries refused: the CPU multiplies them from
+ * now on. After the chain's frames that may read them. */
+static void v41_vk_forget_range(const void *base, size_t bytes) {
+    uintptr_t b = (uintptr_t)base;
+    for (size_t i = 0; i < g_vk_cap; i++) {
+        VkEntry *e = &g_vk_map[i];
+        if (!e->data || (uintptr_t)e->data < b || (uintptr_t)e->data - b >= bytes) continue;
+        if (e->t) { if (vkc_ready()) vkc_finish(); coli_vk_tensor_free(e->t); e->t = NULL; }
+        e->refused = 1; e->dho = 0;
+    }
+}
+/* Layers k.. off the device again (layer k did not reach it): their device copies freed
+ * and what the device held alone read back from disk; from here on they load and run as
+ * without Vulkan. */
+static void v41_dho_unplace(Model *m, int k) {
+    for (size_t h = 0; h < g_v41_home_n; h++) {
+        V41Home *x = &g_v41_home[h];
+        if (x->layer < k) continue;
+        v41_vk_forget_range(x->base, x->bytes);
+        if (x->gone) v41_dho_host(x->base);
+        x->placed = 1;
+    }
+    if (g_v41_dho_layers > k) g_v41_dho_layers = k;
+    coli_vk_dense_host_layers(k, m->c.n_layers);
+}
+/* The matrices read since the last call: up, then their pages back. wo_a goes up whole
+ * for the chain and per output group for the per-matrix path (attention_project's
+ * block views), each only where that path runs. With a partial chain (the fit) a layer
+ * goes up whole or not at all, its chain state with it (v41c_build_layer): its pages go
+ * back only once all of it is on the device, so a layer that does not get there reads
+ * nothing back; it ends the chain before it (vkc_fit_shrink). */
+static unsigned g_v41_dho_kept;
+static void v41_dho_place(Model *m, int mark) {   /* mark: the layer just read (its fault count noted), -1 none */
+    const Cfg *c = &m->c;
+    int chain = v41c_decide(m), fit = g_v41_fit.L > 0, failed = -1;
+    const char *why = "a matrix the device refused";
+    size_t from = g_v41_home_n;
+    for (size_t k = 0; k < g_v41_home_n; k++) if (!g_v41_home[k].placed) { from = k; break; }
+    for (size_t k = from; k < g_v41_home_n; k++) {
+        V41Home *h = &g_v41_home[k];
+        if (h->placed) continue;
+        h->placed = 1;
+        if (failed >= 0) continue;
+        int ok;
+        size_t n = strlen(h->name), tail = strlen(".attn.wo_a.weight");
+        if (h->kind == 8 && n > tail && !strcmp(h->name + n - tail, ".attn.wo_a.weight")) {
+            ok = 1;
+            if (chain) ok = v41_dho_up(h->base, h->tiles, 12, h->O, h->I);
+            int tiles_i = (h->I + FP8_TILE - 1) / FP8_TILE;
+            for (int g = 0; ok && chain != COLI_VK_CHAIN_ON && g < c->o_groups; g++)
+                ok = v41_dho_up(h->base + (size_t)g * c->o_lora * h->I,
+                                h->tiles + (size_t)(g * c->o_lora / FP8_TILE) * tiles_i, 12, c->o_lora, h->I);
+        } else ok = v41_dho_up(h->base, h->tiles, h->kind == 8 ? 12 : 11, h->O, h->I);
+        if (fit) { if (!ok) failed = h->layer >= 0 ? h->layer : 0; continue; }
+        if (ok && !v41_map_drop(h->base, h->bytes)) { h->gone = 1; coli_vk_dense_host_dropped(h->bytes); }
+        else g_v41_dho_kept++;
+    }
+    if (!fit) return;
+    if (failed < 0 && mark >= 0 && mark < g_v41_fit.n && !v41c_build_layer(m, mark, &why)) failed = mark;
+    if (failed >= 0) {   /* everything of that layer and after off the device, the chain cut before it */
+        v41c_cut_layer(m, failed, why);
+        return;
+    }
+    for (size_t k = from; k < g_v41_home_n; k++) {   /* the whole batch is there: its pages back */
+        V41Home *h = &g_v41_home[k];
+        if (h->gone || h->layer >= g_v41_dho_layers) continue;
+        if (!v41_map_drop(h->base, h->bytes)) { h->gone = 1; coli_vk_dense_host_dropped(h->bytes); }
+        else g_v41_dho_kept++;
+    }
+    if (mark >= 0 && mark < g_v41_fit.n) vkc_fit_mark(&g_v41_fit, mark);
+}
+#define V41_DHO(call) do { g_v41_map = g_v41_dho && g_v41_load_layer < g_v41_dho_layers; call; g_v41_map = 0; } while (0)
+#else
+#define V41_DHO(call) call
+#endif
+
+static void model_load(Model *m, const char *snap, int ecap, int engram_cache_rows) {
+    Cfg *c = &m->c;
+    cfg_load(c, snap);
+    attn_project_check(c);
+    /* Sized with the state it describes. CTX caps max_positions (#1526), so this
+     * is one int per position the engine can actually hold, not per position the
+     * checkpoint allows. A failure here disables reuse and nothing else. */
+    kv_prefix_alloc(&m->kvp, c->max_positions);
+    /* COLI_MODEL_DIRS: the container split across drives as DISTINCT shards, so
+     * the 510 GB this engine streams can live on two drives of ~256 GB instead
+     * of one of 512 -- which is the configuration most people can actually
+     * build, and it needs no second copy. The mirror below is the other half of
+     * the same idea: that one duplicates the bytes and splits the reads, this
+     * one splits the bytes and reads each shard from the one drive holding it.
+     * They compose: a mirror dir may copy any subset of the split's shards. */
+    const char *extra_dirs = getenv("COLI_MODEL_DIRS");
+    st_init_multi(&m->S, snap, (extra_dirs && *extra_dirs) ? extra_dirs : NULL);
+    /* DUAL-SSD: register COLI_MODEL_MIRROR copies and settle the read split
+     * before the first expert read, so nothing has been pulled from the primary
+     * by the time the replicas exist. */
+    mirror_setup(&m->S, snap, c->n_routed);
+    engram_load_sidecar(&m->engram, snap);
+#ifdef COLI_VULKAN
+    v41_dho_open(m);   /* COLI_VK_DENSE_HOST: the trunk to the device as it is read, its host pages back */
+#endif
+
+    int dim = c->dim, hd = c->head_dim, nh = c->n_heads, hc = c->hc_mult;
+    m->L = xmalloc((size_t)c->n_layers * sizeof(Layer), "layers");
+    memset(m->L, 0, (size_t)c->n_layers * sizeof(Layer));
+    wb_load(&m->S, &m->embed, "embed.weight", c->vocab, dim);
+    wb_load(&m->S, &m->head, "head.weight", c->vocab, dim);
+    wf_load(&m->S, &m->norm, "norm.weight", dim);
+
+    char name[256];
+    #define NAME(fmt, ...) (snprintf(name, sizeof(name), fmt, __VA_ARGS__), name)
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        l->engram_index = -1;
+#ifdef COLI_VULKAN
+        g_v41_load_layer = i;
+#endif
+        V41_DHO(w8_load(&m->S, &l->wq_a, NAME("layers.%d.attn.wq_a.weight", i), c->q_lora, dim));
+        V41_DHO(w8_load(&m->S, &l->wq_b, NAME("layers.%d.attn.wq_b.weight", i), nh * hd, c->q_lora));
+        V41_DHO(w8_load(&m->S, &l->wkv,  NAME("layers.%d.attn.wkv.weight", i), hd, dim));
+        V41_DHO(w8_load(&m->S, &l->wo_a, NAME("layers.%d.attn.wo_a.weight", i),
+                c->o_groups * c->o_lora, nh * hd / c->o_groups));
+        V41_DHO(w8_load(&m->S, &l->wo_b, NAME("layers.%d.attn.wo_b.weight", i), dim, c->o_groups * c->o_lora));
+        wf_load(&m->S, &l->q_norm,   NAME("layers.%d.attn.q_norm.weight", i), c->q_lora);
+        wf_load(&m->S, &l->kv_norm,  NAME("layers.%d.attn.kv_norm.weight", i), hd);
+        wf_load(&m->S, &l->attn_sink,NAME("layers.%d.attn.attn_sink", i), nh);
+        wf_load(&m->S, &l->attn_norm,NAME("layers.%d.attn_norm.weight", i), dim);
+        wf_load(&m->S, &l->ffn_norm, NAME("layers.%d.ffn_norm.weight", i), dim);
+        int mix = (2 + hc) * hc;
+        wf_load(&m->S, &l->hc_attn_fn,   NAME("layers.%d.hc_attn_fn", i), (int64_t)mix * hc * dim);
+        wf_load(&m->S, &l->hc_ffn_fn,    NAME("layers.%d.hc_ffn_fn", i), (int64_t)mix * hc * dim);
+        wf_load(&m->S, &l->hc_attn_base, NAME("layers.%d.hc_attn_base", i), mix);
+        wf_load(&m->S, &l->hc_ffn_base,  NAME("layers.%d.hc_ffn_base", i), mix);
+        wf_load(&m->S, &l->hc_attn_scale,NAME("layers.%d.hc_attn_scale", i), 3);
+        wf_load(&m->S, &l->hc_ffn_scale, NAME("layers.%d.hc_ffn_scale", i), 3);
+        wb_load(&m->S, &l->gate_w, NAME("layers.%d.ffn.gate.weight", i), c->n_routed, dim);
+        wf_load(&m->S, &l->gate_bias, NAME("layers.%d.ffn.gate.bias", i), c->n_routed);
+        V41_DHO(w8_load(&m->S, &l->sh_w1, NAME("layers.%d.ffn.shared_experts.w1.weight", i), c->moe_inter, dim));
+        V41_DHO(w8_load(&m->S, &l->sh_w3, NAME("layers.%d.ffn.shared_experts.w3.weight", i), c->moe_inter, dim));
+        V41_DHO(w8_load(&m->S, &l->sh_w2, NAME("layers.%d.ffn.shared_experts.w2.weight", i), dim, c->moe_inter));
+
+        l->window = xmalloc((size_t)c->window * hd * sizeof(float), "window ring");
+        memset(l->window, 0, (size_t)c->window * hd * sizeof(float));
+        l->window_pos = xmalloc((size_t)c->window * sizeof(int), "window positions");
+        for (int k = 0; k < c->window; k++) l->window_pos[k] = -1;
+        /* Sized from spec_block, NOT from n_mtp: the released config.json
+         * carries the block size and omits the stage count, so n_mtp is still
+         * zero here and only becomes 3 inside spec_load, which runs after this
+         * loop. Reading it here allocated one row and the first speculative
+         * step then wrote six into it -- a heap overflow that the tiny fixture
+         * could not show, because the config this repository writes for it
+         * does declare n_mtp_layers. The block size is what bounds a batch. */
+        int rows = c->spec_block > 0 ? c->spec_block + 1 : 1;
+        l->ring_save = xmalloc((size_t)rows * hd * sizeof(float), "displaced ring keys");
+        l->ring_save_pos = xmalloc((size_t)rows * sizeof(int), "displaced ring positions");
+        int ratio = c->compress_ratio[i];
+        if (c->kv_source[i]) {
+            V41_DHO(wb_load(&m->S, &l->comp_wkv, NAME("layers.%d.attn.compressor.wkv.weight", i), hd, dim));
+            wf_load(&m->S, &l->comp_norm, NAME("layers.%d.attn.compressor.norm.weight", i), hd);
+            if (ratio > 1) {
+                V41_DHO(wb_load(&m->S, &l->comp_wgate, NAME("layers.%d.attn.compressor.wgate.weight", i), hd, dim));
+                l->cstate_kv = xmalloc((size_t)ratio * hd * sizeof(float), "compressor group");
+                l->cstate_score = xmalloc((size_t)ratio * hd * sizeof(float), "compressor scores");
+                l->cstate_save_kv = xmalloc((size_t)rows * hd * sizeof(float), "displaced group");
+                l->cstate_save_score = xmalloc((size_t)rows * hd * sizeof(float), "displaced scores");
+                l->cstate_save_slot = xmalloc((size_t)rows * sizeof(int), "displaced group slots");
+                memset(l->cstate_kv, 0, (size_t)ratio * hd * sizeof(float));
+                for (int k = 0; k < ratio * hd; k++) l->cstate_score[k] = -INFINITY;
+            }
+            int slots = c->max_positions / (ratio > 0 ? ratio : 1);
+            l->ckv = xmalloc((size_t)slots * hd * sizeof(float), "compressed kv");
+            memset(l->ckv, 0, (size_t)slots * hd * sizeof(float));
+            l->ikey = xmalloc((size_t)slots * c->index_head_dim * sizeof(float), "index keys");
+            memset(l->ikey, 0, (size_t)slots * c->index_head_dim * sizeof(float));
+            V41_DHO(wb_load(&m->S, &l->idx_wk, NAME("layers.%d.attn.indexer.wk.weight", i),
+                    c->index_head_dim, hd));
+            wf_load(&m->S, &l->idx_knorm, NAME("layers.%d.attn.indexer.k_norm.weight", i),
+                    c->index_head_dim);
+        }
+        if (c->index_source[i]) {
+            V41_DHO(w8_load(&m->S, &l->idx_wq_b, NAME("layers.%d.attn.indexer.wq_b.weight", i),
+                    c->index_n_heads * c->index_head_dim, c->q_lora));
+            V41_DHO(wb_load(&m->S, &l->idx_wproj, NAME("layers.%d.attn.indexer.weights_proj.weight", i),
+                    c->index_n_heads, dim));
+        }
+        /* an engram table's projection, read with its layer (the device-only placement puts
+         * a layer up whole); the tables themselves open below */
+        for (int t = 0; m->engram.active && t < m->engram.n_layers; t++)
+            if (m->engram.layer_of[t] == i)
+                V41_DHO(w8_load(&m->S, &l->eng_wkv, NAME("layers.%d.engram.wkv.weight", i),
+                        dim * (hc + 1), m->engram.cols * m->engram.head_dim));
+#ifdef COLI_VULKAN
+        if (g_v41_dho) v41_dho_place(m, i);   /* one layer in RAM at a time */
+#endif
+    }
+    if (m->engram.active) {
+        Engram *e = &m->engram;
+        for (int t = 0; t < e->n_layers; t++) {
+            int layer = e->layer_of[t];
+            if (layer < 0 || layer >= c->n_layers) {
+                fprintf(stderr, "[engram] table %d names layer %d\n", t, layer); exit(1); }
+            m->L[layer].engram_index = t;
+            engram_table_open(&e->table[t], &m->S, layer, e->head_dim, engram_cache_rows);
+            wf_load(&m->S, &m->L[layer].eng_q, NAME("layers.%d.engram.q_weight", layer),
+                    (int64_t)hc * dim);
+            wf_load(&m->S, &m->L[layer].eng_k, NAME("layers.%d.engram.k_weight", layer),
+                    (int64_t)hc * dim);
+        }
+    }
+#ifdef COLI_VULKAN
+    g_v41_load_layer = -1;
+#endif
+    #undef NAME
+
+    /* expert cache: `ecap` slots per layer, each holding one expert's three matrices */
+    m->ecap = ecap;
+    m->cache = xmalloc((size_t)c->n_layers * sizeof(LCache), "expert caches");
+    for (int i = 0; i < c->n_layers; i++) cache_init(m, &m->cache[i], ecap);
+    spec_load(m, ecap);
+    if (c->vision_layers > 0) {
+        m->vision = xmalloc(sizeof(Vision), "vision tower");
+        memset(m->vision, 0, sizeof(Vision));
+        vision_load(m, m->vision);
+        if (!m->vision->active) { free(m->vision); m->vision = NULL; }
+    }
+    m->rope_window = rope_table(c->rope_dim, c->max_positions, 0, c->rope_theta,
+                                c->rope_factor, c->beta_fast, c->beta_slow);
+    m->rope_compress = rope_table(c->rope_dim, c->max_positions, c->original_seq_len,
+                                  c->compress_rope_theta, c->rope_factor,
+                                  c->beta_fast, c->beta_slow);
+    m->pos = 0;
+}
+
+static const float *rope_for(const Model *m, int layer) {
+    return m->c.compress_ratio[layer] ? m->rope_compress : m->rope_window;
+}
+
+/* ----------------------------------------------------------- attention ----- */
+
+/* model.py get_window_topk_idxs, one batch: which ring slots query `t` may read.
+ * Prefill indexes the chunk itself (slot i is position i); decode indexes the ring.
+ *
+ * On decode the readable set is stated in POSITIONS, not in slot numbers: a slot is
+ * readable when the position it holds is at or before this query's own and still
+ * inside the window. For one token a step that is the same thing as the vendor's
+ * `i > start_pos` test, since slot i then holds position i until the ring wraps. For a
+ * speculative step it is not: the ring also holds the drafts that were rejected, whose
+ * positions are ahead of every query that follows, and the position map is what keeps
+ * them out. The traversal stays oldest-slot-first, per query, because the attention
+ * kernel sums in list order and a different order is a different rounding. */
+static int window_slot_ok(const Layer *l, int slot, int pos, int win) {
+    int held = l->window_pos[slot];
+    return held >= 0 && held <= pos && held > pos - win;
+}
+
+static void window_idxs(const Cfg *c, const Layer *l, int n, int start_pos, int t,
+                        int *out, int *count) {
+    int win = c->window;
+    if (start_pos == 0) {
+        int width = n < win ? n : win;
+        int first = t - win + 1; if (first < 0) first = 0;
+        for (int i = 0; i < width; i++) {
+            int idx = first + i;
+            out[i] = idx > t ? -1 : idx;
+        }
+        *count = width;
+    } else {
+        int pos = start_pos + t;
+        int oldest = pos % win + 1;
+        int at = 0;
+        for (int i = oldest; i < win; i++) out[at++] = window_slot_ok(l, i, pos, win) ? i : -1;
+        for (int i = 0; i < oldest; i++) out[at++] = window_slot_ok(l, i, pos, win) ? i : -1;
+        *count = win;
+    }
+}
+
+/* kernel.py sparse_attn for one query: `idx` lists the rows of `kv` this query reads,
+ * -1 meaning nothing. The sink joins the denominator only, so a query with no readable
+ * row comes out zero instead of NaN. */
+/* The kernel itself lives in sparse_attn.h, where a test can reach it. `score` is
+ * the caller's scratch: this runs once per head per position per layer, and a
+ * malloc in that place was costing more than some of the arithmetic. */
+static void sparse_attend(float *out, const float *q, const float *kv, const int *idx,
+                          int count, int nh, int hd, float sink_h, float scale,
+                          float *score) {
+    coli_sparse_attend(out, q, kv, idx, count, hd, sink_h, scale, score);
+    (void)nh;
+}
+
+/* model.py Compressor.forward. Writes the latents this chunk completes into `latent`
+ * and returns how many there are (pre-RoPE, as the indexer needs them unrotated). */
+static int compressor_run(Model *m, int layer, const float *x, int n, int start_pos,
+                          float *latent, int *rows) {
+    Cfg *c = &m->c;
+    Layer *l = &m->L[layer];
+    int hd = c->head_dim, ratio = c->compress_ratio[layer];
+    if (ratio == 1) {
+        float *kv = xmalloc((size_t)n * hd * sizeof(float), "compressor kv");
+        mvb_rows(kv, hd, &l->comp_wkv, x, c->dim, n);
+        for (int t = 0; t < n; t++) {
+            rms_into(latent + (size_t)t * hd, kv + (size_t)t * hd, l->comp_norm.w, hd, c->norm_eps);
+            rows[t] = start_pos + t;
+        }
+        free(kv);
+        return n;
+    }
+    float *kv = xmalloc((size_t)n * hd * sizeof(float), "compressor kv");
+    float *score = xmalloc((size_t)n * hd * sizeof(float), "compressor scores");
+    mvb_rows(kv, hd, &l->comp_wkv, x, c->dim, n);
+    mvb_rows(score, hd, &l->comp_wgate, x, c->dim, n);
+    int produced = 0;
+    if (start_pos == 0) {
+        int remainder = n % ratio, cutoff = n - remainder;
+        for (int g = 0; g * ratio < cutoff; g++) {
+            for (int i = 0; i < hd; i++) {
+                float best = -INFINITY;
+                for (int k = 0; k < ratio; k++) {
+                    float value = score[(size_t)(g * ratio + k) * hd + i];
+                    if (value > best) best = value;
+                }
+                float total = 0.0f, mixed = 0.0f;
+                for (int k = 0; k < ratio; k++) {
+                    float weight = expf(score[(size_t)(g * ratio + k) * hd + i] - best);
+                    total += weight;
+                    mixed += weight * kv[(size_t)(g * ratio + k) * hd + i];
+                }
+                latent[(size_t)g * hd + i] = mixed / total;
+            }
+            rows[produced++] = g;
+        }
+        for (int k = 0; k < remainder; k++) {
+            memcpy(l->cstate_kv + (size_t)k * hd, kv + (size_t)(cutoff + k) * hd, (size_t)hd * sizeof(float));
+            memcpy(l->cstate_score + (size_t)k * hd, score + (size_t)(cutoff + k) * hd, (size_t)hd * sizeof(float));
+        }
+    } else {
+        /* One position at a time, which is what a decode step is -- and a speculative
+         * step is several of them in a row. The group state is indexed by position
+         * modulo the ratio, so a draft that is rejected leaves its slot to be rewritten
+         * by the token that really lands there, before the group can complete. */
+        for (int t = 0; t < n; t++) {
+            int pos = start_pos + t;
+            int slot = pos % ratio;
+            if (n > 1 && m->rollback_save) {
+                memcpy(l->cstate_save_kv + (size_t)t * hd, l->cstate_kv + (size_t)slot * hd,
+                       (size_t)hd * sizeof(float));
+                memcpy(l->cstate_save_score + (size_t)t * hd, l->cstate_score + (size_t)slot * hd,
+                       (size_t)hd * sizeof(float));
+                l->cstate_save_slot[t] = slot;
+            }
+            memcpy(l->cstate_kv + (size_t)slot * hd, kv + (size_t)t * hd, (size_t)hd * sizeof(float));
+            memcpy(l->cstate_score + (size_t)slot * hd, score + (size_t)t * hd, (size_t)hd * sizeof(float));
+            if ((pos + 1) % ratio) continue;
+            float *out = latent + (size_t)produced * hd;
+            for (int i = 0; i < hd; i++) {
+                float best = -INFINITY;
+                for (int k = 0; k < ratio; k++) {
+                    float value = l->cstate_score[(size_t)k * hd + i];
+                    if (value > best) best = value;
+                }
+                float total = 0.0f, mixed = 0.0f;
+                for (int k = 0; k < ratio; k++) {
+                    float weight = expf(l->cstate_score[(size_t)k * hd + i] - best);
+                    total += weight;
+                    mixed += weight * l->cstate_kv[(size_t)k * hd + i];
+                }
+                out[i] = mixed / total;
+            }
+            rows[produced++] = pos / ratio;
+        }
+    }
+    if (produced) {
+        float *pooled = xmalloc((size_t)produced * hd * sizeof(float), "pooled latents");
+        memcpy(pooled, latent, (size_t)produced * hd * sizeof(float));
+        for (int g = 0; g < produced; g++)
+            rms_into(latent + (size_t)g * hd, pooled + (size_t)g * hd, l->comp_norm.w, hd, c->norm_eps);
+        free(pooled);
+    }
+    free(kv); free(score);
+    return produced;
+}
+
+/* model.py select_candidate_blocks, one query row. `keep` is `width` bytes. */
+static void candidate_blocks(const Cfg *c, const float *score, int width, int lens, uint8_t *keep) {
+    int block = c->candidate_block_size;
+    int blocks = (width + block - 1) / block;
+    float *best = xmalloc((size_t)blocks * sizeof(float), "block scores");
+    for (int b = 0; b < blocks; b++) {
+        float top = -INFINITY;
+        for (int i = b * block; i < (b + 1) * block && i < width; i++)
+            if (score[i] > top) top = score[i];
+        best[b] = top;
+    }
+    int last = (lens - 1) / block;
+    if (last >= 0 && last < blocks) best[last] = INFINITY;   /* the newest block is pinned in */
+    int wanted = c->candidate_topk_blocks < blocks ? c->candidate_topk_blocks : blocks;
+    memset(keep, 0, (size_t)width);
+    for (int pick = 0; pick < wanted; pick++) {
+        int chosen = -1;
+        for (int b = 0; b < blocks; b++)
+            if (best[b] > -INFINITY && (chosen < 0 || best[b] > best[chosen])) chosen = b;
+        if (chosen < 0) break;
+        for (int i = chosen * block; i < (chosen + 1) * block && i < width; i++) keep[i] = 1;
+        best[chosen] = -INFINITY;
+    }
+    free(best);
+}
+
+/* Does this layer complete a compression group at `pos`, and so republish its index
+ * keys? model.py: `if self.owns_k and latent is not None`. */
+static int layer_publishes(const Cfg *c, int layer, int pos) {
+    int ratio = c->compress_ratio[layer];
+    if (!c->kv_source[layer] || ratio <= 0) return 0;
+    return ratio == 1 || (pos + 1) % ratio == 0;
+}
+
+/* Which layer's index keys row `t` reads, or -1 for "whatever the step began with".
+ * Sequential order is (position, layer): everything at an earlier position happened,
+ * whatever its layer, and at this position only the layers up to this one -- including
+ * this one, which publishes before its own indexer runs. */
+static int published_owner(const Model *m, int layer, int start_pos, int t) {
+    if (m->pub_rows == 0) return -1;              /* one position: the step's own slot */
+    for (int L = layer; L >= 0; L--)
+        if (layer_publishes(&m->c, L, start_pos + t)) return L;
+    for (int j = t - 1; j >= 0; j--)
+        if (m->pub_layer[j] >= 0) return m->pub_layer[j];
+    return -1;
+}
+
+/* model.py Indexer.forward: score every compressed position this query can reach and
+ * keep the best `index_topk`, in position order, shifted by `offset`. */
+static void indexer_run(Model *m, int layer, const float *x, const float *qr, int n,
+                        int start_pos, int offset, int compress_len,
+                        int *out, int stride, int topk) {
+    Cfg *c = &m->c;
+    Layer *l = &m->L[layer];
+    int owner = c->index_owner[layer];
+    int nh = c->index_n_heads, ihd = c->index_head_dim, ratio = c->compress_ratio[layer];
+    int tidy = getenv("V41_INDEX_OWNER") != NULL;
+    const float *rope = rope_for(m, layer);
+    /* The query and weight projections for a block of positions at once (the
+     * device's GEMM instead of a GEMV per position; the CPU bits are mv8's and
+     * mvb's either way), then each position scores in order as before. */
+    int block = n < MV_ROWS_MAX ? n : MV_ROWS_MAX;
+    float *qblk = xmalloc((size_t)block * nh * ihd * sizeof(float), "indexer queries");
+    float *wblk = xmalloc((size_t)block * nh * sizeof(float), "indexer weights");
+    float *score = xmalloc((size_t)compress_len * sizeof(float), "indexer scores");
+    float scale = (1.0f / sqrtf((float)ihd)) * (1.0f / sqrtf((float)nh));
+
+    for (int t = 0; t < n; t++) {
+        if (t % block == 0) {
+            int rows = n - t < block ? n - t : block;
+            mv8_rows(qblk, nh * ihd, &l->idx_wq_b, qr + (size_t)t * c->q_lora, c->q_lora, rows);
+            mvb_rows(wblk, nh, &l->idx_wproj, x + (size_t)t * c->dim, c->dim, rows);
+        }
+        float *q = qblk + (size_t)(t % block) * nh * ihd, *weights = wblk + (size_t)(t % block) * nh;
+        const float *ikey = m->L[owner].ikey;
+        if (!tidy) {
+            int published = published_owner(m, layer, start_pos, t);
+            if (published >= 0) ikey = m->L[published].ikey;
+            else if (m->pub_rows > 0) { if (m->pub_before) ikey = m->pub_before; }
+            /* One position reads whatever was published last; a prefill reads its
+             * own index owner, whose keys already cover the whole chunk and are
+             * masked to each query's reach by `lens` above. A resumed prefill
+             * inherits a published pointer from the previous turn, and honouring
+             * it here would make the same position read different keys than it
+             * read when prefilled cold. */
+            else if (n == 1 && m->published_index_k) ikey = m->published_index_k;
+        }
+        for (int h = 0; h < nh; h++)
+            rope_apply(q + (size_t)h * ihd + ihd - c->rope_dim, rope, start_pos + t, c->rope_dim, 0);
+        for (int h = 0; h < nh; h++) weights[h] *= scale;
+        /* how many compressed positions this query can reach: the groups closed at or
+         * before its own position, which is one expression for prefill and decode
+         * alike -- and, for a speculative step, per row rather than per step */
+        int lens = (start_pos + t + 1) / ratio;
+        for (int j = 0; j < compress_len; j++) {
+            if (j >= lens) { score[j] = -INFINITY; continue; }
+            float total = 0.0f;
+            for (int h = 0; h < nh; h++) {
+                const float *qh = q + (size_t)h * ihd;
+                const float *k = ikey + (size_t)j * ihd;
+                float dot = 0.0f;
+                for (int i = 0; i < ihd; i++) dot += qh[i] * k[i];
+                if (dot > 0.0f) total += dot * weights[h];    /* relu, then the head weight */
+            }
+            score[j] = total;
+        }
+        if (layer == c->candidate_source) {
+            if (m->candidate_width != compress_len || m->candidate_rows != n) {
+                free(m->candidates);
+                m->candidates = xmalloc((size_t)n * compress_len, "candidate mask");
+                m->candidate_width = compress_len;
+                m->candidate_rows = n;
+            }
+            candidate_blocks(c, score, compress_len, lens, m->candidates + (size_t)t * compress_len);
+        } else if (c->candidate_source >= 0 && c->candidate_source < layer && m->candidates) {
+            const uint8_t *keep = m->candidates + (size_t)t * m->candidate_width;
+            for (int j = 0; j < compress_len && j < m->candidate_width; j++)
+                if (!keep[j]) score[j] = -INFINITY;
+        }
+        /* top-k, then back into position order: the attention kernel treats every slot
+         * independently, but keeping them sorted makes the concatenated index list
+         * readable and matches the reference's `.sort()`. */
+        int *row = out + (size_t)t * stride;   /* the compressed half of this query's list */
+        for (int k = 0; k < topk; k++) row[k] = -1;
+        int taken = 0;
+        for (int k = 0; k < topk; k++) {
+            int best = -1;
+            for (int j = 0; j < compress_len; j++) {
+                if (score[j] == -INFINITY) continue;
+                int already = 0;
+                for (int u = 0; u < taken; u++) if (row[u] == j) { already = 1; break; }
+                if (already) continue;
+                if (best < 0 || score[j] > score[best]) best = j;
+            }
+            if (best < 0) break;
+            row[taken++] = best;
+        }
+        for (int a = 0; a < taken; a++)          /* insertion sort: taken <= index_topk */
+            for (int b = a + 1; b < taken; b++)
+                if (row[b] < row[a]) { int swap = row[a]; row[a] = row[b]; row[b] = swap; }
+        for (int k = 0; k < topk; k++)
+            row[k] = (k < taken && row[k] < lens) ? row[k] + offset : -1;
+    }
+    free(qblk); free(wblk); free(score);
+}
+
+/* wo_a is block diagonal over o_groups: each group projects only its own heads, and
+ * only then does wo_b mix the groups. Shared with the DSpark stages, whose attention
+ * differs in what it reads but not in how it comes out. */
+static void attn_project_out_rows(Model *m, Layer *l, const float *heads, int rows, float *out) {
+    Cfg *c = &m->c;
+    int per_group = c->n_heads * c->head_dim / c->o_groups;
+    int width = c->o_groups * c->o_lora;
+    int head_stride = c->n_heads * c->head_dim;
+    float *grouped = xmalloc((size_t)rows * width * sizeof(float), "grouped");
+    for (int g = 0; g < c->o_groups; g++) {
+        /* A W8 view of group g's block. The scale array is indexed by the GLOBAL
+         * output row, so the view is only the same matrix when a group's rows start
+         * on a tile boundary -- which o_lora being a multiple of 32 is what makes
+         * true, and what the fallback below covers when it is not. */
+        W8 block;
+        block.q = l->wo_a.q + (size_t)g * c->o_lora * per_group;
+        block.s = l->wo_a.s + (size_t)(g * c->o_lora / FP8_TILE)
+                            * ((per_group + FP8_TILE - 1) / FP8_TILE);
+        block.O = c->o_lora;
+        block.I = per_group;
+        mv8_rows(grouped + (size_t)g * c->o_lora, width, &block,
+                 heads + (size_t)g * per_group, head_stride, rows);
+    }
+    mv8_rows(out, c->dim, &l->wo_b, grouped, width, rows);
+    free(grouped);
+}
+
+/* wo_a's groups have to start on a scale tile for the block view above to name the
+ * same weights. Checked once at load rather than asserted in the hot path. */
+static void attn_project_check(const Cfg *c) {
+    if (c->o_lora % FP8_TILE != 0) {
+        fprintf(stderr, "[v41] o_lora_rank %d is not a multiple of the %d-wide scale tile: "
+                        "the grouped output projection cannot be read as blocks\n",
+                c->o_lora, FP8_TILE);
+        exit(1);
+    }
+}
+
+/* model.py Attention.forward. `x` is the normalized block input [n, dim]. */
+static void attention_run(Model *m, int layer, const float *x, int n, int start_pos, float *out) {
+    Cfg *c = &m->c;
+    Layer *l = &m->L[layer];
+    int dim = c->dim, hd = c->head_dim, nh = c->n_heads, rd = c->rope_dim;
+    int ratio = c->compress_ratio[layer], owner = c->index_owner[layer];
+    const float *rope = rope_for(m, layer);
+    double started = now_s();
+
+    float *qr = xmalloc((size_t)n * c->q_lora * sizeof(float), "q latent");
+    float *q = xmalloc((size_t)n * nh * hd * sizeof(float), "queries");
+    float *kv = xmalloc((size_t)n * hd * sizeof(float), "kv");
+    float *scratch = xmalloc((size_t)n * c->q_lora * sizeof(float), "q projection");
+    float *kv_raw = xmalloc((size_t)n * hd * sizeof(float), "kv projection");
+
+    /* One pass of each matrix for the whole block of positions, rather than one
+     * pass per position: wq_b alone is 42 MB, and during prefill this is the
+     * difference between reading it once and reading it once per prompt token. */
+    mv8_rows(scratch, c->q_lora, &l->wq_a, x, dim, n);
+    for (int t = 0; t < n; t++)
+        rms_into(qr + (size_t)t * c->q_lora, scratch + (size_t)t * c->q_lora,
+                 l->q_norm.w, c->q_lora, c->norm_eps);
+    mv8_rows(q, nh * hd, &l->wq_b, qr, c->q_lora, n);
+    mv8_rows(kv_raw, hd, &l->wkv, x, dim, n);
+    for (int t = 0; t < n; t++) {
+        for (int h = 0; h < nh; h++)
+            rope_apply(q + (size_t)t * nh * hd + (size_t)h * hd + hd - rd, rope, start_pos + t, rd, 0);
+        rms_into(kv + (size_t)t * hd, kv_raw + (size_t)t * hd, l->kv_norm.w, hd, c->norm_eps);
+        rope_apply(kv + (size_t)t * hd + hd - rd, rope, start_pos + t, rd, 0);
+    }
+
+    /* the window half: prefill reads the chunk, decode reads the ring */
+    const float *window_kv;
+    int window_rows;
+    if (start_pos == 0) {
+        int win = c->window;
+        if (n <= win) {
+            memcpy(l->window, kv, (size_t)n * hd * sizeof(float));
+        } else {
+            int cut = n % win;
+            const float *tail = kv + (size_t)(n - win) * hd;
+            memcpy(l->window + (size_t)cut * hd, tail, (size_t)(win - cut) * hd * sizeof(float));
+            memcpy(l->window, tail + (size_t)(win - cut) * hd, (size_t)cut * hd * sizeof(float));
+        }
+        /* both branches above leave position p in slot p % win */
+        for (int p = n > win ? n - win : 0; p < n; p++) l->window_pos[p % win] = p;
+        window_kv = kv; window_rows = n;
+    } else {
+        /* The ring is written one position at a time, down in the attention loop, and
+         * not here: a step that carries several positions would otherwise overwrite the
+         * oldest slot before the first row has read it. The window a query sees has to
+         * be the window it would have seen alone, which means writing its key, reading,
+         * and only then writing the next one. */
+        window_kv = l->window; window_rows = c->window;
+    }
+
+    int window_width = start_pos == 0 ? (n < c->window ? n : c->window) : c->window;
+    int compress_len = ratio ? (start_pos + n) / ratio : 0;
+    int index_topk = 0;
+    if (ratio) {
+        index_topk = c->index_topk < compress_len ? c->index_topk : compress_len;
+        if (index_topk < 0) index_topk = 0;
+    }
+    int total_idx = window_width + index_topk;
+    int *idx = xmalloc((size_t)n * total_idx * sizeof(int), "attention indices");
+    for (int t = 0; t < n; t++) {
+        int count = 0;
+        window_idxs(c, l, n, start_pos, t, idx + (size_t)t * total_idx, &count);
+        for (int k = count; k < window_width; k++) idx[(size_t)t * total_idx + k] = -1;
+    }
+
+    float *kv_all = NULL;
+    if (ratio) {
+        /* the compressor runs before the indexer: the indexer scores the latent before
+         * RoPE, and the cache write below rotates it in place */
+        float *latent = NULL;
+        int *latent_row = NULL;
+        int produced = 0;
+        if (c->kv_source[layer]) {
+            int room = n / (ratio ? ratio : 1) + 1;
+            latent = xmalloc((size_t)room * hd * sizeof(float), "latents");
+            latent_row = xmalloc((size_t)room * sizeof(int), "latent rows");
+            produced = compressor_run(m, layer, x, n, start_pos, latent, latent_row);
+            if (produced) {
+                /* index keys first, from the un-rotated latent. A latent rotates at the
+                 * FIRST position of the group it pools, which is its row times the
+                 * ratio -- the same value the vendor spells two different ways on the
+                 * prefill and decode paths. */
+                float *keys = xmalloc((size_t)produced * c->index_head_dim * sizeof(float), "index keys");
+                mvb_rows(keys, c->index_head_dim, &l->idx_wk, latent, hd, produced);
+                for (int g = 0; g < produced; g++) {
+                    float *dest = l->ikey + (size_t)latent_row[g] * c->index_head_dim;
+                    rms_into(dest, keys + (size_t)g * c->index_head_dim, l->idx_knorm.w,
+                             c->index_head_dim, c->norm_eps);
+                    rope_apply(dest + c->index_head_dim - rd, rope, latent_row[g] * ratio, rd, 0);
+                }
+                free(keys);
+                /* publish, as model.py does, only when a group completed */
+                m->published_index_k = l->ikey;
+                m->published_index_layer = layer;
+            }
+        }
+        if (c->index_source[layer]) {
+            if (compress_len > 0 && index_topk > 0)
+                /* The offset is how many ROWS the window half occupies in kv_all, not
+                 * how many index columns it takes: during prefill the window half is
+                 * the whole chunk (n rows) while each query lists at most `window`
+                 * columns of it. model.py passes kv.size(1) here for the same reason. */
+                indexer_run(m, layer, x, qr, n, start_pos, window_rows, compress_len,
+                            idx + window_width, total_idx, index_topk);
+            else
+                for (int t = 0; t < n; t++)
+                    for (int k = window_width; k < total_idx; k++) idx[(size_t)t * total_idx + k] = -1;
+            /* publish for the layers between here and the next index source */
+            if (m->shared_topk_rows != n || m->shared_topk_width != index_topk) {
+                free(m->shared_topk);
+                m->shared_topk = xmalloc((size_t)n * (index_topk > 0 ? index_topk : 1) * sizeof(int),
+                                         "published index list");
+                m->shared_topk_rows = n; m->shared_topk_width = index_topk;
+            }
+            for (int t = 0; t < n; t++)
+                for (int k = 0; k < index_topk; k++)
+                    m->shared_topk[(size_t)t * index_topk + k] = idx[(size_t)t * total_idx + window_width + k];
+        } else {
+            /* Not an index source: reuse what the last one published, exactly as
+             * model.py does through shared_attn.topk_idxs. Recomputing here would be
+             * wrong as well as wasteful -- these layers have no indexer weights. */
+            for (int t = 0; t < n; t++)
+                for (int k = 0; k < index_topk; k++) {
+                    int value = -1;
+                    if (m->shared_topk && t < m->shared_topk_rows && k < m->shared_topk_width)
+                        value = m->shared_topk[(size_t)t * m->shared_topk_width + k];
+                    idx[(size_t)t * total_idx + window_width + k] = value;
+                }
+        }
+        if (produced) {
+            for (int g = 0; g < produced; g++) {
+                float *dest = l->ckv + (size_t)latent_row[g] * hd;
+                memcpy(dest, latent + (size_t)g * hd, (size_t)hd * sizeof(float));
+                rope_apply(dest + hd - rd, rope, latent_row[g] * ratio, rd, 0);
+            }
+        }
+        free(latent); free(latent_row);
+        kv_all = xmalloc((size_t)(window_rows + compress_len) * hd * sizeof(float), "kv all");
+        memcpy(kv_all, window_kv, (size_t)window_rows * hd * sizeof(float));
+        memcpy(kv_all + (size_t)window_rows * hd, m->L[owner].ckv,
+               (size_t)compress_len * hd * sizeof(float));
+    }
+
+    const float *kv_read = ratio ? kv_all : window_kv;
+    /* A block of positions' heads, so the output projection can run as one block
+     * too. Bounded rather than the whole chunk: at 64 heads of 512 this is 128 KB a
+     * position, and a long prompt would otherwise ask for a quarter of a gigabyte
+     * of it. */
+    int hblock = n < MV_ROWS_MAX ? n : MV_ROWS_MAX;
+    float *heads = xmalloc((size_t)hblock * nh * hd * sizeof(float), "attention output");
+    float *head_score = xmalloc((size_t)nh * total_idx * sizeof(float), "attention scores");
+    float attn_scale = 1.0f / sqrtf((float)hd);
+    for (int t = 0; t < n; t++) {
+        if (start_pos > 0) {
+            int pos = start_pos + t, slot = pos % c->window;
+            if (n > 1 && m->rollback_save) {
+                memcpy(l->ring_save + (size_t)t * hd, l->window + (size_t)slot * hd,
+                       (size_t)hd * sizeof(float));
+                l->ring_save_pos[t] = l->window_pos[slot];
+            }
+            memcpy(l->window + (size_t)slot * hd, kv + (size_t)t * hd, (size_t)hd * sizeof(float));
+            l->window_pos[slot] = pos;
+            /* kv_all holds a copy of the ring, so it takes the same write */
+            if (kv_all) memcpy(kv_all + (size_t)slot * hd, kv + (size_t)t * hd,
+                               (size_t)hd * sizeof(float));
+            int count = 0;
+            window_idxs(c, l, n, start_pos, t, idx + (size_t)t * total_idx, &count);
+            for (int k = count; k < window_width; k++) idx[(size_t)t * total_idx + k] = -1;
+        }
+        const int *row = idx + (size_t)t * total_idx;
+        float *row_heads = heads + (size_t)(t % hblock) * nh * hd;
+        #pragma omp parallel for schedule(static)
+        for (int h = 0; h < nh; h++)
+            sparse_attend(row_heads + (size_t)h * hd, q + (size_t)t * nh * hd + (size_t)h * hd,
+                          kv_read, row, total_idx, nh, hd, l->attn_sink.w[h], attn_scale,
+                          head_score + (size_t)h * total_idx);
+        for (int h = 0; h < nh; h++)
+            rope_apply(row_heads + (size_t)h * hd + hd - rd, rope, start_pos + t, rd, 1);
+        /* The projection reads the heads and writes `out`; it touches no cached
+         * state, so it waits until the block is full and then runs once for it. */
+        if (t % hblock == hblock - 1 || t == n - 1) {
+            int first = t - (t % hblock);
+            attn_project_out_rows(m, l, heads, t - first + 1, out + (size_t)first * dim);
+        }
+    }
+    m->t_attn += now_s() - started;
+    free(head_score); free(kv_raw);
+    free(heads); free(kv_all); free(idx); free(scratch); free(kv); free(q); free(qr);
+}
+
+/* ------------------------------------------------------------------ MoE ---- */
+
+/* One expert's SwiGLU. The clamps are the training kernel's, and they matter: they
+ * are what keeps fp4 activations in range. */
+/* silu(gate) * clamp(up), in place over `gate`, for however many rows are in it */
+static void swiglu_into(const Cfg *c, float *gate, const float *up, int64_t count) {
+    for (int64_t i = 0; i < count; i++) {
+        float g = gate[i], u = up[i];
+        if (c->swiglu_limit > 0.0f) {
+            if (u >  c->swiglu_limit) u =  c->swiglu_limit;
+            if (u < -c->swiglu_limit) u = -c->swiglu_limit;
+            if (g >  c->swiglu_limit) g =  c->swiglu_limit;
+        }
+        gate[i] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
+/* One routed expert applied to every position that chose it. The expert is 18.8 MB
+ * on the released checkpoint and matmul_mxfp4 already walks its rows once for a
+ * block of inputs, so a position that shares an expert with another costs the
+ * arithmetic and not a second pass over the weights. Each output row is what the
+ * one-at-a-time call produced, bit for bit: the S loop sits inside the row loop,
+ * so a row's groups fold in the same order whatever else is in the block. */
+static void expert_ffn_rows(Model *m, const uint8_t *w1, const uint8_t *s1,
+                            const uint8_t *w3, const uint8_t *s3,
+                            const uint8_t *w2, const uint8_t *s2,
+                            const float *x, int rows, float *down) {
+    Cfg *c = &m->c;
+    int inter = c->moe_inter, dim = c->dim;
+    float *gate = xmalloc((size_t)rows * inter * sizeof(float), "expert gate");
+    float *up = xmalloc((size_t)rows * inter * sizeof(float), "expert up");
+    double started = now_s();
+    matmul_mxfp4(gate, x, w1, s1, rows, dim, inter);
+    matmul_mxfp4(up,   x, w3, s3, rows, dim, inter);
+    swiglu_into(c, gate, up, (int64_t)rows * inter);
+    matmul_mxfp4(down, gate, w2, s2, rows, inter, dim);
+    m->t_expert += now_s() - started;
+    free(up); free(gate);
+}
+
+/* The shared expert every token pays for; fp8, so it stays resident and never
+ * streams -- but it is still 35 MB of matrices, and reading them once for a block
+ * of positions rather than once per position is the same saving mv8_rows makes in
+ * attention. */
+/* The shared expert's output rows into `down` ... */
+static void shared_ffn_down(Model *m, Layer *l, const float *x, int rows, float *down) {
+    Cfg *c = &m->c;
+    int inter = c->moe_inter, dim = c->dim;
+    float *gate = xmalloc((size_t)rows * inter * sizeof(float), "shared gate");
+    float *up = xmalloc((size_t)rows * inter * sizeof(float), "shared up");
+    mv8_rows(gate, inter, &l->sh_w1, x, dim, rows);
+    mv8_rows(up,   inter, &l->sh_w3, x, dim, rows);
+    swiglu_into(c, gate, up, (int64_t)rows * inter);
+    mv8_rows(down, dim, &l->sh_w2, gate, inter, rows);
+    free(up); free(gate);
+}
+/* ... and added to `out` */
+static void shared_ffn_rows(Model *m, Layer *l, const float *x, int rows, float *out) {
+    int dim = m->c.dim;
+    float *down = xmalloc((size_t)rows * dim * sizeof(float), "shared down");
+    shared_ffn_down(m, l, x, rows, down);
+    for (int64_t i = 0; i < (int64_t)rows * dim; i++) out[i] += down[i];
+    free(down);
+}
+
+/* model.py Gate + MoE. The bias steers the choice of experts and nothing else: the
+ * weights come from the unbiased scores, which is the whole point of noaux_tc.
+ * Split out of the MoE proper so a whole block of positions can be routed before
+ * any expert is read -- which is what lets the reads and the matmuls be shared.
+ * `scores` holds the position's gate logits (the caller projects the block at once)
+ * and is overwritten. */
+static void moe_gate(Model *m, Layer *l, int E, int topk, float *scores,
+                     int *chosen, float *weights) {
+    Cfg *c = &m->c;
+    for (int e = 0; e < E; e++) {
+        float value = scores[e] / c->gate_temp;
+        /* sqrtsoftplus: softplus then square root, in fp32 as the vendor does */
+        float softplus = value > 20.0f ? value : logf(1.0f + expf(value));
+        scores[e] = sqrtf(softplus);
+    }
+    for (int k = 0; k < topk; k++) {
+        int best = -1;
+        for (int e = 0; e < E; e++) {
+            int taken = 0;
+            for (int u = 0; u < k; u++) if (chosen[u] == e) { taken = 1; break; }
+            if (taken) continue;
+            if (best < 0 || scores[e] + l->gate_bias.w[e] > scores[best] + l->gate_bias.w[best]) best = e;
+        }
+        chosen[k] = best;
+        weights[k] = scores[best];
+    }
+    if (c->norm_topk_prob && topk > 1) {
+        float total = 0.0f;
+        for (int k = 0; k < topk; k++) total += weights[k];
+        total += 1e-20f;                       /* the vendor's constant, not norm_eps */
+        for (int k = 0; k < topk; k++) weights[k] /= total;
+    }
+    for (int k = 0; k < topk; k++) weights[k] *= c->route_scale;
+}
+
+#define MOE_TOPK_MAX 64
+/* Positions routed together. Bounded so the per-chunk scratch stays a few
+ * megabytes however long the prompt is, and so the experts one chunk asks for
+ * stay a plausible working set for the cache. */
+#define MOE_ROW_CHUNK 32
+
+#ifdef COLI_VULKAN
+/* ---- the Vulkan routed-expert tier (vk_tier.c) ---------------------------------
+ * One block of positions of a backbone layer with the tier on. The block's resident
+ * experts go to the device as one batch (vkt_issue) while the CPU computes the other
+ * draws expert-major, as moe_run_at does, and the shared expert into a buffer of its
+ * own; then every rank of every position joins the output in rank order, the
+ * device's rows and the CPU's alike (w x row, then the add), and the shared expert
+ * after them, as moe_run_at adds them. So the order of the sum never depends on
+ * which experts were resident. Every expert the CPU computed passes its slot to the
+ * tier (vkt_note), which may promote it. The DSpark stages ("mtp"), with caches of
+ * their own, are the tier's extra layers n_layers + stage when it took them
+ * (COLI_VK_TIER_MTP). */
+static char g_vk_usage[2100];   /* the tier's history (vk_tier_start); empty = none */
+static void vk_tier_save(void) { if (g_vk_usage[0]) rt_save(g_vk_usage, 1); }
+
+static VktExpertSrc vk_slot_src(const Slot *s) {
+    return (VktExpertSrc){s->w1, s->w3, s->w2, s->s1, s->s3, s->s2};
+}
+
+/* The draws want[d] of a block on the CPU into contrib[d] = w x expert(x): moe_run_at's
+ * expert-major union over those draws only. */
+static void moe_vk_cpu(Model *m, LCache *cache, const char *kind, int layer, int topk, const float *xc, int rows,
+                       const int *chosen, const float *weights, const uint8_t *want, float *contrib) {
+    Cfg *c = &m->c;
+    int dim = c->dim, draws = rows * topk;
+    /* a block of up to MOE_ROW_CHUNK rows, or a streamed prompt chunk (vkt_step_rows) */
+    int *uniq = xmalloc((size_t)draws * 5 * sizeof(int), "expert union");
+    int *head = uniq + draws, *tail = head + draws, *count = tail + draws, *next = count + draws;
+    int n_uniq = 0;
+    for (int d = 0; d < draws; d++) {
+        if (!want[d]) continue;
+        int eid = chosen[d], at = -1;
+        for (int u = 0; u < n_uniq; u++) if (uniq[u] == eid) { at = u; break; }
+        next[d] = -1;
+        if (at < 0) { at = n_uniq++; uniq[at] = eid; head[at] = d; count[at] = 0; }
+        else next[tail[at]] = d;
+        tail[at] = d;
+        count[at]++;
+    }
+    if (!n_uniq) { free(uniq); return; }
+    float *gathered = xmalloc((size_t)rows * dim * sizeof(float), "expert inputs");
+    float *down = xmalloc((size_t)rows * dim * sizeof(float), "expert outputs");
+    int step = cache->cap < MOE_ROW_CHUNK ? cache->cap : MOE_ROW_CHUNK;
+    for (int u0 = 0; u0 < n_uniq; u0 += step) {
+        int ne = n_uniq - u0 < step ? n_uniq - u0 : step;
+        Slot *slot[MOE_ROW_CHUNK];
+        expert_slots_at(m, cache, kind, layer, uniq + u0, ne, slot);
+        for (int u = 0; u < ne; u++) {
+            int cnt = count[u0 + u], at = 0;
+            for (int d = head[u0 + u]; d >= 0; d = next[d], at++)
+                memcpy(gathered + (size_t)at * dim, xc + (size_t)(d / topk) * dim, (size_t)dim * sizeof(float));
+            expert_ffn_rows(m, slot[u]->w1, slot[u]->s1, slot[u]->w3, slot[u]->s3,
+                            slot[u]->w2, slot[u]->s2, gathered, cnt, down);
+            at = 0;
+            for (int d = head[u0 + u]; d >= 0; d = next[d], at++) {
+                float w = weights[d];
+                float *dst = contrib + (size_t)d * dim;
+                const float *src = down + (size_t)at * dim;
+                for (int i = 0; i < dim; i++) dst[i] = w * src[i];
+            }
+            m->hits += (uint64_t)(cnt - 1);
+            VktExpertSrc src = vk_slot_src(slot[u]);
+            vkt_note(v41_tier_layer(m, kind, layer), uniq[u0 + u], &src);
+        }
+    }
+    free(down); free(gathered); free(uniq);
+}
+
+/* kind "layers" (the backbone) or "mtp" (a DSpark stage, the tier's extra layer: no
+ * history row and no EMAP mark, as on the CPU path) */
+static void moe_vk_block(Model *m, Layer *l, LCache *cache, const char *kind, int layer, int topk, const float *xc,
+                         int rows, float *outc, const int *chosen, const float *weights, int with_shared) {
+    int dim = m->c.dim, draws = rows * topk, backbone = !strcmp(kind, "layers");
+    uint8_t *taken = xmalloc((size_t)draws * 2, "device draws"), *want = taken + draws;
+    const float **dev = xmalloc((size_t)draws * sizeof(*dev), "device rows");
+    for (int r = 0; backbone && r < rows; r++) rt_count(layer, chosen + r * topk, topk);
+    int ndev = vkt_issue(v41_tier_layer(m, kind, layer), xc, rows, topk, chosen, taken);
+    for (int d = 0; d < draws; d++) { want[d] = !taken[d]; if (taken[d] && backbone) ehit_mark(m, layer, chosen[d]); }
+    float *contrib = xmalloc((size_t)draws * dim * sizeof(float), "expert contributions");
+    float *shared = xmalloc((size_t)rows * dim * sizeof(float), "shared expert");
+    moe_vk_cpu(m, cache, kind, layer, topk, xc, rows, chosen, weights, want, contrib);
+    if (with_shared) shared_ffn_down(m, l, xc, rows, shared);
+    if (ndev && !vkt_join(dev)) {   /* the batch failed (the tier stops): those draws here */
+        moe_vk_cpu(m, cache, kind, layer, topk, xc, rows, chosen, weights, taken, contrib);
+        memset(taken, 0, (size_t)draws);
+    }
+    for (int r = 0; r < rows; r++) {
+        float *o = outc + (size_t)r * dim;
+        memset(o, 0, (size_t)dim * sizeof(float));
+        for (int k = 0; k < topk; k++) {
+            int d = r * topk + k;
+            if (taken[d]) {
+                float w = weights[d];
+                const float *src = dev[d];
+                for (int i = 0; i < dim; i++) o[i] += w * src[i];
+            } else {
+                const float *cvec = contrib + (size_t)d * dim;
+                for (int i = 0; i < dim; i++) o[i] += cvec[i];
+            }
+        }
+        const float *sh = shared + (size_t)r * dim;
+        if (with_shared) for (int i = 0; i < dim; i++) o[i] += sh[i];
+    }
+    free(shared); free(contrib); free(taken); free(dev);
+}
+/* The tier's streaming (a big prompt chunk's cold experts on the device): a group of a
+ * backbone layer's experts through its cache as moe_vk_cpu reads them (expert_slots_at:
+ * the misses fetched together), up to the cache's capacity, valid until the next read. */
+static int vk_load_batch(void *ctx, int layer, const int *e, int n, VktExpertSrc *srcs, void **h) {
+    Model *m = ctx;
+    LCache *cache = &m->cache[layer];
+    if (n > cache->cap) n = cache->cap;
+    if (n > 64) n = 64;
+    if (n < 1) return 0;
+    Slot *slot[64];
+    expert_slots_at(m, cache, "layers", layer, e, n, slot);
+    for (int u = 0; u < n; u++) { srcs[u] = vk_slot_src(slot[u]); h[u] = slot[u]; }
+    return n;
+}
+static int vk_load(void *ctx, int layer, int e, VktExpertSrc *src, void **h) {
+    return vk_load_batch(ctx, layer, &e, 1, src, h) == 1;
+}
+static void vk_unhold(void *ctx, void *h) { (void)ctx; (void)h; }
+#endif
+
+/* The MoE for a block of positions, expert-major.
+ *
+ * Position-major is the obvious reading and it is what this did: route a
+ * position, read its six experts, multiply, move on. During prefill that reads
+ * the same expert again for the next position that wants it -- 18.8 MB off the
+ * device or out of RAM, for arithmetic that could have ridden along with the
+ * first. Routing the whole block first turns the six-per-position draws into a
+ * list of DISTINCT experts, each read once and applied to every position that
+ * asked for it, with matmul_mxfp4 walking its rows a single time for all of them.
+ *
+ * The arithmetic is unchanged and so are the values. Each expert's contribution
+ * is kept apart and the contributions are summed into the output in rank order
+ * afterwards, exactly as the position-major loop accumulated them; a row's
+ * matmul folds its groups in the same order whatever else shares the block.
+ *
+ * A cache too small to hold one position's experts keeps the old path: there the
+ * slots genuinely cannot all be live at once. */
+/* with_shared 0: the routed experts only (the dense chain runs the shared expert on the
+ * device and adds it there, in the same place of the sum). */
+static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int layer,
+                       int E, int topk, const float *x, int n, float *out, int with_shared) {
+    Cfg *c = &m->c;
+    int dim = c->dim;
+    if (topk > MOE_TOPK_MAX) {
+        fprintf(stderr, "[moe] n_activated %d exceeds the scratch\n", topk); exit(1); }
+#ifdef COLI_VULKAN
+    /* the tier streams a prompt chunk's cold experts: the whole step in one block, so
+     * each expert's rows meet in one GEMM (moe_vk_block's arrays follow its size) */
+    if (vkt_ready() && !strcmp(kind, "layers") && vkt_step_rows(n, MOE_ROW_CHUNK) > MOE_ROW_CHUNK) {
+        int *chosen = xmalloc((size_t)n * topk * sizeof(int), "routing");
+        float *weights = xmalloc((size_t)n * topk * sizeof(float), "routing weights");
+        float *scores = xmalloc((size_t)n * E * sizeof(float), "gate scores");
+        mvb_rows(scores, E, &l->gate_w, x, dim, n);
+        for (int r = 0; r < n; r++)
+            moe_gate(m, l, E, topk, scores + (size_t)r * E, chosen + r * topk, weights + r * topk);
+        free(scores);
+        moe_vk_block(m, l, cache, kind, layer, topk, x, n, out, chosen, weights, with_shared);
+        free(chosen); free(weights);
+        return;
+    }
+#endif
+
+    for (int r0 = 0; r0 < n; r0 += MOE_ROW_CHUNK) {
+        int rows = n - r0 < MOE_ROW_CHUNK ? n - r0 : MOE_ROW_CHUNK;
+        const float *xc = x + (size_t)r0 * dim;
+        float *outc = out + (size_t)r0 * dim;
+        int chosen[MOE_ROW_CHUNK * MOE_TOPK_MAX];
+        float weights[MOE_ROW_CHUNK * MOE_TOPK_MAX];
+        float *scores = xmalloc((size_t)rows * E * sizeof(float), "gate scores");
+        mvb_rows(scores, E, &l->gate_w, xc, dim, rows);   /* the chunk's gate logits at once */
+        for (int r = 0; r < rows; r++)
+            moe_gate(m, l, E, topk, scores + (size_t)r * E,
+                     chosen + r * topk, weights + r * topk);
+        free(scores);
+#ifdef COLI_VULKAN
+        if (vkt_ready() && v41_tier_layer(m, kind, layer) < vkt_layers()) {   /* the backbone, a stage the tier took */
+            moe_vk_block(m, l, cache, kind, layer, topk, xc, rows, outc, chosen, weights, with_shared);
+            continue;
+        }
+#endif
+
+        int draws = rows * topk;
+        if (cache->cap < topk) {
+            /* one position at a time, and one expert at a time inside it */
+            for (int r = 0; r < rows; r++) {
+                float *o = outc + (size_t)r * dim;
+                memset(o, 0, (size_t)dim * sizeof(float));
+                float *down = xmalloc((size_t)dim * sizeof(float), "expert down");
+                for (int k = 0; k < topk; k++) {
+                    Slot *s = expert_slot_at(m, cache, kind, layer, chosen[r * topk + k]);
+                    expert_ffn_rows(m, s->w1, s->s1, s->w3, s->s3, s->w2, s->s2,
+                                    xc + (size_t)r * dim, 1, down);
+                    float w = weights[r * topk + k];
+                    for (int i = 0; i < dim; i++) o[i] += w * down[i];
+                }
+                free(down);
+            }
+            if (with_shared) shared_ffn_rows(m, l, xc, rows, outc);
+            continue;
+        }
+
+        /* the distinct experts this block asks for, each with the draws that asked */
+        int *uniq = xmalloc((size_t)draws * sizeof(int), "routed expert set");
+        int *head = xmalloc((size_t)draws * sizeof(int), "expert draw list");
+        int *tail = xmalloc((size_t)draws * sizeof(int), "expert draw tail");
+        int *count = xmalloc((size_t)draws * sizeof(int), "expert draw count");
+        int *next = xmalloc((size_t)draws * sizeof(int), "expert draw chain");
+        int n_uniq = 0;
+        for (int d = 0; d < draws; d++) {
+            int eid = chosen[d], at = -1;
+            for (int u = 0; u < n_uniq; u++) if (uniq[u] == eid) { at = u; break; }
+            next[d] = -1;
+            if (at < 0) {
+                at = n_uniq++;
+                uniq[at] = eid; head[at] = d; count[at] = 0;
+            } else {
+                next[tail[at]] = d;
+            }
+            tail[at] = d;
+            count[at]++;
+        }
+
+        float *contrib = xmalloc((size_t)draws * dim * sizeof(float), "expert contributions");
+        float *gathered = xmalloc((size_t)rows * dim * sizeof(float), "expert inputs");
+        float *down = xmalloc((size_t)rows * dim * sizeof(float), "expert outputs");
+        int step = cache->cap < MOE_ROW_CHUNK ? cache->cap : MOE_ROW_CHUNK;
+        /* Two ways of overlapping these reads with the matmuls were built and
+         * measured here, and both were worse. A posix_fadvise(WILLNEED) hint for the
+         * next chunk blocks against a device already saturated by the demand reads:
+         * four seconds of wall to save one of disk, the same result the V4 engine
+         * got. A pool of reader threads, so each expert is multiplied as soon as its
+         * own six tensors land, does overlap -- the main thread's wait on disk falls
+         * from 10.4 s to 1.0 s -- but the expert matmul rises from 7.6 s to 18.1 s
+         * and the turn is 7% slower, 25% slower at four readers and 68% slower at two. A 5.9 MB pread is
+         * not free CPU: it is a kernel-side copy competing for the same memory
+         * bandwidth the matmuls are already bound by, and the idle disk wait it
+         * removes costs more than it was worth. Both are measurements, not opinions;
+         * they are written down so the third attempt starts from them. */
+        for (int u0 = 0; u0 < n_uniq; u0 += step) {
+            int ne = n_uniq - u0 < step ? n_uniq - u0 : step;
+            Slot *slot[MOE_ROW_CHUNK];
+            expert_slots_at(m, cache, kind, layer, uniq + u0, ne, slot);
+            for (int u = 0; u < ne; u++) {
+                int cnt = count[u0 + u], at = 0;
+                for (int d = head[u0 + u]; d >= 0; d = next[d], at++)
+                    memcpy(gathered + (size_t)at * dim, xc + (size_t)(d / topk) * dim,
+                           (size_t)dim * sizeof(float));
+                expert_ffn_rows(m, slot[u]->w1, slot[u]->s1, slot[u]->w3, slot[u]->s3,
+                                slot[u]->w2, slot[u]->s2, gathered, cnt, down);
+                at = 0;
+                for (int d = head[u0 + u]; d >= 0; d = next[d], at++) {
+                    float w = weights[d];
+                    float *dst = contrib + (size_t)d * dim;
+                    const float *src = down + (size_t)at * dim;
+                    for (int i = 0; i < dim; i++) dst[i] = w * src[i];
+                }
+                /* the draws after the first found the expert resident, which is what
+                 * the position-major loop would have recorded for them too */
+                m->hits += (uint64_t)(cnt - 1);
+            }
+        }
+        for (int r = 0; r < rows; r++) {
+            float *o = outc + (size_t)r * dim;
+            memset(o, 0, (size_t)dim * sizeof(float));
+            for (int k = 0; k < topk; k++) {
+                const float *cvec = contrib + (size_t)(r * topk + k) * dim;
+                for (int i = 0; i < dim; i++) o[i] += cvec[i];
+            }
+        }
+        if (with_shared) shared_ffn_rows(m, l, xc, rows, outc);
+        free(down); free(gathered); free(contrib);
+        free(next); free(count); free(tail); free(head); free(uniq);
+    }
+}
+
+static void moe_run(Model *m, int layer, const float *x, int n, float *out) {
+    moe_run_at(m, &m->L[layer], &m->cache[layer], "layers", layer,
+               m->c.n_routed, m->c.n_activated, x, n, out, 1);
+}
+
+/* --------------------------------------------------------------- engram ---- */
+
+/* model.py Engram.forward: look the n-grams up, project them into one key per residual
+ * copy plus a shared value, and gate the value in by how well key and stream agree. */
+static void engram_run(Model *m, int layer, float *h, int n, int start_pos) {
+    Cfg *c = &m->c;
+    Engram *e = &m->engram;
+    Layer *l = &m->L[layer];
+    int table = l->engram_index, hc = c->hc_mult, dim = c->dim;
+    double started = now_s();
+    /* Blocked like the rest: the n-gram rows are looked up for a block of positions,
+     * then eng_wkv projects the whole block in one pass. The matrix is 157 MB on the
+     * released head, which is a lot to walk once per position. */
+    int width = e->cols * e->head_dim, kv_width = dim * (hc + 1);
+    int chunk = n < MOE_ROW_CHUNK ? n : MOE_ROW_CHUNK;
+    float *rows = xmalloc((size_t)chunk * width * sizeof(float), "engram rows");
+    float *kv_all = xmalloc((size_t)chunk * kv_width * sizeof(float), "engram kv");
+    int64_t ids[V41_MAX_NGRAM * V41_MAX_EHEADS];
+    for (int t0 = 0; t0 < n; t0 += chunk) {
+        int rows_here = n - t0 < chunk ? n - t0 : chunk;
+        for (int r = 0; r < rows_here; r++) {
+            engram_hash(e, table, start_pos + t0 + r, ids);
+            for (int col = 0; col < e->cols; col++) {
+                const float *row = engram_row(&e->table[table], ids[col], e->head_dim);
+                memcpy(rows + (size_t)r * width + (size_t)col * e->head_dim, row,
+                       (size_t)e->head_dim * sizeof(float));
+            }
+        }
+        mv8_rows(kv_all, kv_width, &l->eng_wkv, rows, width, rows_here);
+        for (int r = 0; r < rows_here; r++) {
+            int t = t0 + r;
+            const float *kv = kv_all + (size_t)r * kv_width;
+            const float *value = kv + (size_t)hc * dim;
+            float *stream = h + (size_t)t * hc * dim;
+            for (int copy = 0; copy < hc; copy++) {
+                const float *key = kv + (size_t)copy * dim;
+                const float *qw = l->eng_q.w + (size_t)copy * dim;
+                const float *kw = l->eng_k.w + (size_t)copy * dim;
+                float *stream_copy = stream + (size_t)copy * dim;
+                double stream_square = 0.0, key_square = 0.0;
+                double dot = 0.0;
+                for (int i = 0; i < dim; i++) {
+                    stream_square += (double)stream_copy[i] * stream_copy[i];
+                    key_square += (double)key[i] * key[i];
+                    dot += (double)stream_copy[i] * qw[i] * kw[i] * key[i];
+                }
+                float rstd = (1.0f / sqrtf((float)(stream_square / dim) + c->norm_eps)) *
+                             (1.0f / sqrtf((float)(key_square / dim) + c->norm_eps));
+                float scaled = (float)dot * rstd / sqrtf((float)dim);
+                /* signed square root before the sigmoid, matching the training kernel */
+                float magnitude = fabsf(scaled);
+                if (magnitude < 1e-6f) magnitude = 1e-6f;
+                float signed_root = sqrtf(magnitude);
+                if (scaled < 0.0f) signed_root = -signed_root;
+                float gate = coli_hc_sigmoid(signed_root);
+                for (int i = 0; i < dim; i++) stream_copy[i] += gate * value[i];
+            }
+        }
+    }
+    trace("engram", layer, h + (size_t)(n - 1) * hc * dim, hc * dim);
+    free(kv_all); free(rows);
+    m->t_engram += now_s() - started;
+}
+
+/* --------------------------------------------------------------- vision ---- */
+
+/* The ViT is small next to the language model (about 600 MB in the released
+ * checkpoint, bf16) and every image needs all of it, so it stays resident: there is
+ * nothing to stream here. What matters for correctness is that its two conventions
+ * differ from the language model's and are easy to get silently wrong:
+ *
+ *   - RoPE is SPLIT-HALF (x[:d/2] against x[d/2:]), not the interleaved pairs the
+ *     text side uses, and it is 2D: each patch carries its row and column angle.
+ *   - the aligner's 3x3 block is ordered channel-major, because torch's F.unfold
+ *     lays a block out as (channel, kh, kw) -- read it row-major and the projection
+ *     sees a permuted image.
+ */
+static void vision_load(Model *m, Vision *v) {
+    Cfg *c = &m->c;
+    if (c->vision_layers < 1) { v->active = 0; return; }
+    if (!st_has(&m->S, "vision.patch_embed.proj.weight")) { v->active = 0; return; }
+    char name[256];
+    #define VNAME(fmt, ...) (snprintf(name, sizeof(name), fmt, __VA_ARGS__), name)
+    int vd = c->vision_dim, patch_in = 3 * c->vision_patch * c->vision_patch;
+    wb_load(&m->S, &v->proj_w, "vision.patch_embed.proj.weight", vd, patch_in);
+    wf_load(&m->S, &v->proj_b, "vision.patch_embed.proj.bias", vd);
+    v->block = xmalloc((size_t)c->vision_layers * sizeof(VisionBlock), "vision blocks");
+    for (int i = 0; i < c->vision_layers; i++) {
+        VisionBlock *b = &v->block[i];
+        wf_load(&m->S, &b->norm1, VNAME("vision.blocks.%d.norm1.weight", i), vd);
+        wf_load(&m->S, &b->norm2, VNAME("vision.blocks.%d.norm2.weight", i), vd);
+        wb_load(&m->S, &b->qkv_w, VNAME("vision.blocks.%d.attn.wqkv.weight", i), 3 * vd, vd);
+        wf_load(&m->S, &b->qkv_b, VNAME("vision.blocks.%d.attn.wqkv.bias", i), 3 * vd);
+        wb_load(&m->S, &b->o_w,   VNAME("vision.blocks.%d.attn.wo.weight", i), vd, vd);
+        wf_load(&m->S, &b->o_b,   VNAME("vision.blocks.%d.attn.wo.bias", i), vd);
+        wb_load(&m->S, &b->w1,    VNAME("vision.blocks.%d.mlp.w1.weight", i), 2 * c->vision_inter, vd);
+        wb_load(&m->S, &b->w2,    VNAME("vision.blocks.%d.mlp.w2.weight", i), vd, c->vision_inter);
+    }
+    wf_load(&m->S, &v->norm, "vision.norm.weight", vd);
+    int ratio = c->vision_ratio;
+    wb_load(&m->S, &v->align_w1, "aligner.w1.weight", c->dim, vd * ratio * ratio);
+    wf_load(&m->S, &v->align_b1, "aligner.w1.bias", c->dim);
+    wb_load(&m->S, &v->align_w2, "aligner.w2.weight", c->dim, c->dim);
+    wf_load(&m->S, &v->align_b2, "aligner.w2.bias", c->dim);
+    wf_load(&m->S, &v->image_start, "image_start", c->dim);
+    wf_load(&m->S, &v->image_end, "image_end", c->dim);
+    wf_load(&m->S, &v->image_newline, "image_newline", c->dim);
+    #undef VNAME
+    v->active = 1;
+}
+
+/* How many rows the aligner returns for a grid: the grid is padded up to the ratio. */
+static int vision_tokens(const Cfg *c, int n_h, int n_w) {
+    int ratio = c->vision_ratio;
+    return ((n_h + ratio - 1) / ratio) * ((n_w + ratio - 1) / ratio);
+}
+
+/* patches: [n_h * n_w, 3 * patch * patch] row-major. out: [vision_tokens, dim]. */
+static void vision_forward(Model *m, Vision *v, const float *patches, int n_h, int n_w, float *out) {
+    Cfg *c = &m->c;
+    int vd = c->vision_dim, heads = c->vision_heads, hd = vd / heads, half = hd / 2;
+    int n = n_h * n_w, patch_in = 3 * c->vision_patch * c->vision_patch;
+    float *x = xmalloc((size_t)n * vd * sizeof(float), "vision stream");
+    /* every projection below runs over all n patches at once (mvb_rows: one device
+     * GEMM, mvb's own bits on the CPU) */
+    mvb_rows(x, vd, &v->proj_w, patches, patch_in, n);
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < vd; j++) x[(size_t)i * vd + j] += v->proj_b.w[j];
+    /* 2D RoPE tables: one angle per (patch, frequency), row and column interleaved
+     * exactly as vision.py stacks them */
+    float *cosine = xmalloc((size_t)n * half * sizeof(float), "vision cos");
+    float *sine = xmalloc((size_t)n * half * sizeof(float), "vision sin");
+    for (int p = 0; p < n; p++) {
+        int row = p / n_w, col = p % n_w;
+        for (int f = 0; f < half; f++) {
+            int axis = f < half / 2 ? 0 : 1;            /* first half rows, second columns */
+            int index = axis ? f - half / 2 : f;
+            float inv = 1.0f / powf(c->vision_rope_theta, (float)(2 * index) / (float)half);
+            float angle = (axis ? col : row) * inv;
+            cosine[(size_t)p * half + f] = cosf(angle);
+            sine[(size_t)p * half + f] = sinf(angle);
+        }
+    }
+    float *qkv_all = xmalloc((size_t)n * 3 * vd * sizeof(float), "vision qkv");
+    float *q = xmalloc((size_t)n * vd * sizeof(float), "vision q");
+    float *k = xmalloc((size_t)n * vd * sizeof(float), "vision k");
+    float *val = xmalloc((size_t)n * vd * sizeof(float), "vision v");
+    float *normed = xmalloc((size_t)n * vd * sizeof(float), "vision normed");
+    float *attended = xmalloc((size_t)n * vd * sizeof(float), "vision attended");
+    float *hidden_all = xmalloc((size_t)n * 2 * c->vision_inter * sizeof(float), "vision mlp");
+    float *projected_all = xmalloc((size_t)n * vd * sizeof(float), "vision projected");
+    float *scores = xmalloc((size_t)n * sizeof(float), "vision scores");
+    for (int layer = 0; layer < c->vision_layers; layer++) {
+        VisionBlock *b = &v->block[layer];
+        for (int i = 0; i < n; i++)
+            rms_into(normed + (size_t)i * vd, x + (size_t)i * vd, b->norm1.w, vd, 1e-6f);
+        mvb_rows(qkv_all, 3 * vd, &b->qkv_w, normed, vd, n);
+        for (int i = 0; i < n; i++) {
+            float *qkv = qkv_all + (size_t)i * 3 * vd;
+            for (int j = 0; j < 3 * vd; j++) qkv[j] += b->qkv_b.w[j];
+            for (int h = 0; h < heads; h++) {
+                const float *co = cosine + (size_t)i * half, *si = sine + (size_t)i * half;
+                for (int part = 0; part < 2; part++) {
+                    const float *src = qkv + part * vd + (size_t)h * hd;
+                    float *dst = (part ? k : q) + (size_t)i * vd + (size_t)h * hd;
+                    for (int f = 0; f < half; f++) {
+                        float a = src[f], bb = src[f + half];
+                        dst[f] = a * co[f] - bb * si[f];
+                        dst[f + half] = bb * co[f] + a * si[f];
+                    }
+                }
+                memcpy(val + (size_t)i * vd + (size_t)h * hd, qkv + 2 * vd + (size_t)h * hd,
+                       (size_t)hd * sizeof(float));
+            }
+        }
+        float scale = 1.0f / sqrtf((float)hd);
+        for (int i = 0; i < n; i++)
+            for (int h = 0; h < heads; h++) {
+                const float *qi = q + (size_t)i * vd + (size_t)h * hd;
+                float best = -INFINITY;
+                for (int j = 0; j < n; j++) {
+                    const float *kj = k + (size_t)j * vd + (size_t)h * hd;
+                    float dot = 0.0f;
+                    for (int d = 0; d < hd; d++) dot += qi[d] * kj[d];
+                    scores[j] = dot * scale;
+                    if (scores[j] > best) best = scores[j];
+                }
+                float total = 0.0f;
+                for (int j = 0; j < n; j++) { scores[j] = expf(scores[j] - best); total += scores[j]; }
+                float *dst = attended + (size_t)i * vd + (size_t)h * hd;
+                for (int d = 0; d < hd; d++) dst[d] = 0.0f;
+                for (int j = 0; j < n; j++) {
+                    const float *vj = val + (size_t)j * vd + (size_t)h * hd;
+                    float weight = scores[j] / total;
+                    for (int d = 0; d < hd; d++) dst[d] += weight * vj[d];
+                }
+            }
+        mvb_rows(projected_all, vd, &b->o_w, attended, vd, n);
+        for (int i = 0; i < n; i++) {
+            const float *projected = projected_all + (size_t)i * vd;
+            for (int j = 0; j < vd; j++) x[(size_t)i * vd + j] += projected[j] + b->o_b.w[j];
+        }
+        for (int i = 0; i < n; i++)
+            rms_into(normed + (size_t)i * vd, x + (size_t)i * vd, b->norm2.w, vd, 1e-6f);
+        mvb_rows(hidden_all, 2 * c->vision_inter, &b->w1, normed, vd, n);
+        for (int i = 0; i < n; i++) {
+            float *hidden = hidden_all + (size_t)i * 2 * c->vision_inter;
+            for (int j = 0; j < c->vision_inter; j++) {
+                float gate = hidden[j], up = hidden[c->vision_inter + j];
+                hidden[j] = (gate / (1.0f + expf(-gate))) * up;
+            }
+        }
+        mvb_rows(projected_all, vd, &b->w2, hidden_all, 2 * c->vision_inter, n);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < vd; j++) x[(size_t)i * vd + j] += projected_all[(size_t)i * vd + j];
+    }
+    for (int i = 0; i < n; i++)
+        rms_into(normed + (size_t)i * vd, x + (size_t)i * vd, v->norm.w, vd, 1e-6f);
+
+    /* aligner: pad the grid, take ratio x ratio blocks channel-major, project */
+    int ratio = c->vision_ratio;
+    int blocks_h = (n_h + ratio - 1) / ratio, blocks_w = (n_w + ratio - 1) / ratio;
+    int block_dim = vd * ratio * ratio;
+    int nblocks = blocks_h * blocks_w;
+    float *blocks = xmalloc((size_t)nblocks * block_dim * sizeof(float), "aligner blocks");
+    float *projected = xmalloc((size_t)nblocks * c->dim * sizeof(float), "aligner hidden");
+    for (int bh = 0; bh < blocks_h; bh++)
+        for (int bw = 0; bw < blocks_w; bw++) {
+            float *block = blocks + (size_t)(bh * blocks_w + bw) * block_dim;
+            for (int ch = 0; ch < vd; ch++)
+                for (int kh = 0; kh < ratio; kh++)
+                    for (int kw = 0; kw < ratio; kw++) {
+                        int row = bh * ratio + kh, col = bw * ratio + kw;
+                        float value = 0.0f;      /* F.pad fills the ragged edge with zeros */
+                        if (row < n_h && col < n_w)
+                            value = normed[(size_t)(row * n_w + col) * vd + ch];
+                        block[((size_t)ch * ratio + kh) * ratio + kw] = value;
+                    }
+        }
+    mvb_rows(projected, c->dim, &v->align_w1, blocks, block_dim, nblocks);
+    for (size_t j = 0; j < (size_t)nblocks * c->dim; j++) {
+        float value = projected[j] + v->align_b1.w[j % c->dim];
+        /* exact GELU, matching torch's default (erf, not the tanh approximation) */
+        projected[j] = 0.5f * value * (1.0f + erff(value / sqrtf(2.0f)));
+    }
+    mvb_rows(out, c->dim, &v->align_w2, projected, c->dim, nblocks);
+    for (size_t j = 0; j < (size_t)nblocks * c->dim; j++) out[j] += v->align_b2.w[j % c->dim];
+    free(projected); free(blocks); free(scores); free(hidden_all); free(projected_all); free(attended);
+    free(normed); free(val); free(k); free(q); free(qkv_all); free(sine); free(cosine); free(x);
+}
+
+/* -------------------------------------------------------------- forward ---- */
+
+/* The mix coefficients a sublayer computes are used by the NEXT one (model.py
+ * Block.forward): attention collapses with what the previous block's FFN produced,
+ * the FFN with what this attention produced. Keeping `pre` out of coli_hc_pre is
+ * exactly why this engine calls coli_hc_split_sinkhorn directly. */
+static void hc_mixes(Model *m, const float *hc_fn, const float *scale, const float *base,
+                     const float *stream, float *pre, float *post, float *comb) {
+    Cfg *c = &m->c;
+    int hc = c->hc_mult, dim = c->dim, flat = hc * dim, mix = (2 + hc) * hc;
+    double square = 0.0;
+    for (int i = 0; i < flat; i++) square += (double)stream[i] * stream[i];
+    float inverse = 1.0f / sqrtf((float)(square / flat) + c->norm_eps);
+    float *mixes = xmalloc((size_t)mix * sizeof(float), "hc mixes");
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < mix; row++) {
+        const float *w = hc_fn + (size_t)row * flat;
+        float sum = 0.0f;
+        for (int i = 0; i < flat; i++) sum += w[i] * stream[i];
+        mixes[row] = sum * inverse;
+    }
+    if (coli_hc_split_sinkhorn(pre, post, comb, mixes, scale, base, hc, c->hc_iters, c->hc_eps) != 0) {
+        fprintf(stderr, "[hc] sinkhorn refused its arguments\n"); exit(1); }
+    free(mixes);
+}
+
+/* Run one chunk: the whole prompt on the first call, one token per call after.
+ * Returns the logits of the last position (the caller owns the buffer). */
+/* `image_rows` (or NULL) is the aligner's output for a pending image and `image_at`
+ * the position where its span starts; the span's embeddings are replaced rather than
+ * looked up. `image_mask` marks those positions for the engram. */
+/* ---------------------------------------------------------------- DSpark ---- */
+
+static int argmax(const float *values, int n);
+
+static void spec_load(Model *m, int ecap) {
+    Cfg *c = &m->c;
+    Spec *sp = &m->spec;
+    if (g_v41_mux_slots > 1) {   /* speculation follows one conversation */
+        fprintf(stderr, "[v41] KV_SLOTS=%d: DSpark stays unloaded, nothing drafts\n", g_v41_mux_slots);
+        return;
+    }
+    /* 60%, and what it buys is not what I expected. The three cold runs:
+     *
+     *     drafts off                 24 forwards   116.6 s
+     *     drafts on, guard at 60     16 forwards    99.3 s
+     *     drafts on, guard disabled   9 forwards   111.5 s
+     *
+     * Speculating pays, and so does stopping. Fewer forwards is not less time:
+     * the early rounds batch six positions through a cold cache and win, the
+     * later ones pay six times the per-row attention for a cache that is now
+     * warm and would have served single tokens cheaply. The guard fires at 53%
+     * acceptance and turns 111 s into 99. It is not really measuring
+     * acceptance, it is measuring the moment batching stops being free -- but
+     * acceptance is the signal that moves with it, and it is the one we have.
+     */
+    sp->min_accept = getenv("V41_DSPARK_MINACC") ? atoi(getenv("V41_DSPARK_MINACC")) : 60;
+    /* how many of the drafted tokens to put in front of the main model. The head always
+     * writes its whole block; verifying fewer of them trades acceptance for a smaller
+     * bill when a round is rejected early. */
+    sp->max_verify = getenv("V41_DSPARK_MAX") ? atoi(getenv("V41_DSPARK_MAX")) : 0;
+    if (sp->min_accept < 0) sp->min_accept = 0;
+    if (sp->min_accept > 100) sp->min_accept = 100;
+    /* The released config.json carries every dspark_* key and NOT n_mtp_layers:
+     * that one lives only in the vendor's inference/config.json, which a user
+     * who downloads the checkpoint never sees. Requiring it meant the draft
+     * head was silently skipped on the real weights while the tiny fixture,
+     * whose config we write ourselves, loaded it fine. Count the stages in the
+     * checkpoint instead, which is the one source that cannot disagree with
+     * itself: they are contiguous from zero. */
+    if (c->n_mtp <= 0 && c->spec_block > 0 && c->n_spec_targets > 0) {
+        char probe[128];
+        int stages = 0;
+        while (stages < 16) {
+            snprintf(probe, sizeof(probe), "mtp.%d.attn.wq_a.weight", stages);
+            if (!st_find(&m->S, probe)) break;
+            stages++;
+        }
+        if (stages > 0) {
+            c->n_mtp = stages;
+            fprintf(stderr, "[v41] n_mtp_layers is absent from config.json; the "
+                            "checkpoint carries %d DSpark stages\n", stages);
+        }
+    }
+    if (c->n_mtp <= 0) return;
+    /* On by default, and the default is a measurement. On a 16-thread CPU
+     * server holding 68% of the experts, from a dropped page cache, the same
+     * 24-token turn takes 116.6 s with no drafting and 99.3 s with it. The
+     * first comparison I ran said the opposite, and it was wrong: the two runs
+     * had not started from the same cache state, which on an engine that reads
+     * its weights from disk decides everything. Cold or it is not a number.
+     *
+     * V41_DSPARK=0 turns the head off and does not load it. */
+    const char *flag = getenv("V41_DSPARK");
+    if (flag && !atoi(flag)) {
+        fprintf(stderr, "[v41] DSpark drafts off (V41_DSPARK=0)\n");
+        return;
+    }
+    if (!st_find(&m->S, "mtp.0.attn.wq_a.weight")) {
+        fprintf(stderr, "[v41] no DSpark head in this checkpoint: drafts off\n");
+        return;
+    }
+    int dim = c->dim, hd = c->head_dim, nh = c->n_heads, hc = c->hc_mult;
+    sp->stage = xmalloc((size_t)c->n_mtp * sizeof(Layer), "DSpark stages");
+    memset(sp->stage, 0, (size_t)c->n_mtp * sizeof(Layer));
+    sp->cache = xmalloc((size_t)c->n_mtp * sizeof(LCache), "DSpark expert caches");
+    char name[256];
+    #define MNAME(fmt, ...) (snprintf(name, sizeof(name), fmt, __VA_ARGS__), name)
+    for (int i = 0; i < c->n_mtp; i++) {
+        Layer *l = &sp->stage[i];
+        l->engram_index = -1;
+        w8_load(&m->S, &l->wq_a, MNAME("mtp.%d.attn.wq_a.weight", i), c->q_lora, dim);
+        w8_load(&m->S, &l->wq_b, MNAME("mtp.%d.attn.wq_b.weight", i), nh * hd, c->q_lora);
+        w8_load(&m->S, &l->wkv,  MNAME("mtp.%d.attn.wkv.weight", i), hd, dim);
+        w8_load(&m->S, &l->wo_a, MNAME("mtp.%d.attn.wo_a.weight", i),
+                c->o_groups * c->o_lora, nh * hd / c->o_groups);
+        w8_load(&m->S, &l->wo_b, MNAME("mtp.%d.attn.wo_b.weight", i), dim, c->o_groups * c->o_lora);
+        wf_load(&m->S, &l->q_norm,    MNAME("mtp.%d.attn.q_norm.weight", i), c->q_lora);
+        wf_load(&m->S, &l->kv_norm,   MNAME("mtp.%d.attn.kv_norm.weight", i), hd);
+        wf_load(&m->S, &l->attn_sink, MNAME("mtp.%d.attn.attn_sink", i), nh);
+        wf_load(&m->S, &l->attn_norm, MNAME("mtp.%d.attn_norm.weight", i), dim);
+        wf_load(&m->S, &l->ffn_norm,  MNAME("mtp.%d.ffn_norm.weight", i), dim);
+        int mix = (2 + hc) * hc;
+        wf_load(&m->S, &l->hc_attn_fn,    MNAME("mtp.%d.hc_attn_fn", i), (int64_t)mix * hc * dim);
+        wf_load(&m->S, &l->hc_ffn_fn,     MNAME("mtp.%d.hc_ffn_fn", i), (int64_t)mix * hc * dim);
+        wf_load(&m->S, &l->hc_attn_base,  MNAME("mtp.%d.hc_attn_base", i), mix);
+        wf_load(&m->S, &l->hc_ffn_base,   MNAME("mtp.%d.hc_ffn_base", i), mix);
+        wf_load(&m->S, &l->hc_attn_scale, MNAME("mtp.%d.hc_attn_scale", i), 3);
+        wf_load(&m->S, &l->hc_ffn_scale,  MNAME("mtp.%d.hc_ffn_scale", i), 3);
+        wb_load(&m->S, &l->gate_w, MNAME("mtp.%d.ffn.gate.weight", i), c->spec_routed, dim);
+        wf_load(&m->S, &l->gate_bias, MNAME("mtp.%d.ffn.gate.bias", i), c->spec_routed);
+        w8_load(&m->S, &l->sh_w1, MNAME("mtp.%d.ffn.shared_experts.w1.weight", i), c->moe_inter, dim);
+        w8_load(&m->S, &l->sh_w3, MNAME("mtp.%d.ffn.shared_experts.w3.weight", i), c->moe_inter, dim);
+        w8_load(&m->S, &l->sh_w2, MNAME("mtp.%d.ffn.shared_experts.w2.weight", i), dim, c->moe_inter);
+        l->window = xmalloc((size_t)c->window * hd * sizeof(float), "DSpark window ring");
+        memset(l->window, 0, (size_t)c->window * hd * sizeof(float));
+        l->window_pos = xmalloc((size_t)c->window * sizeof(int), "DSpark window positions");
+        for (int k = 0; k < c->window; k++) l->window_pos[k] = -1;
+        cache_init(m, &sp->cache[i], ecap);
+    }
+    w8_load(&m->S, &sp->main_proj, "mtp.0.main_proj.weight", dim, dim * c->n_spec_targets);
+    wf_load(&m->S, &sp->main_norm, "mtp.0.main_norm.weight", dim);
+    int last = c->n_mtp - 1;
+    wf_load(&m->S, &sp->norm, MNAME("mtp.%d.norm.weight", last), dim);
+    wb_load(&m->S, &sp->markov_embed, MNAME("mtp.%d.markov_head.embed.weight", last),
+            c->vocab, c->markov_rank);
+    wb_load(&m->S, &sp->markov_out, MNAME("mtp.%d.markov_head.head.weight", last),
+            c->vocab, c->markov_rank);
+    wb_load(&m->S, &sp->conf_proj, MNAME("mtp.%d.confidence_head.proj.weight", last),
+            1, dim + c->markov_rank);
+    #undef MNAME
+    sp->active = 1;
+    fprintf(stderr, "[v41] DSpark on: %d stages, %d experts (%d routed), %d tokens per draft\n",
+            c->n_mtp, c->spec_routed, c->spec_activated, c->spec_block);
+}
+
+/* model.py DSparkAttention.forward.
+ *
+ * `main_x` carries the positions the main model has just committed: their keys go into
+ * this stage's ring, which is what makes the draft head see the real sequence rather
+ * than its own guesses. With `out` NULL that is all this does, which is the prefill
+ * call and the catch-up for positions that were accepted from a previous draft.
+ *
+ * The drafts then query that ring plus each other. Every draft row reads every other
+ * one, future included: the vendor hands the same index list to all of them, and it is
+ * right that it does -- the block is one guess, not a sequence anything committed to. */
+static void spec_attention(Model *m, int stage, const float *x, int block, int start_pos,
+                           const float *main_x, int main_rows, float *out) {
+    Cfg *c = &m->c;
+    Layer *l = &m->spec.stage[stage];
+    int dim = c->dim, hd = c->head_dim, nh = c->n_heads, rd = c->rope_dim, win = c->window;
+    const float *rope = m->rope_window;          /* a stage never compresses */
+    double started = now_s();
+    int scratch_rows = main_rows > block ? main_rows : block;
+    float *scratch = xmalloc((size_t)scratch_rows * (c->q_lora > hd ? c->q_lora : hd)
+                             * sizeof(float), "spec scratch");
+
+    mv8_rows(scratch, hd, &l->wkv, main_x, dim, main_rows);
+    for (int t = 0; t < main_rows; t++) {
+        int pos = start_pos + t;
+        float *slot = l->window + (size_t)(pos % win) * hd;
+        rms_into(slot, scratch + (size_t)t * hd, l->kv_norm.w, hd, c->norm_eps);
+        rope_apply(slot + hd - rd, rope, pos, rd, 0);
+        l->window_pos[pos % win] = pos;
+    }
+    if (!out) { free(scratch); m->t_attn += now_s() - started; return; }
+
+    float *qr = xmalloc((size_t)block * c->q_lora * sizeof(float), "spec q latent");
+    float *q = xmalloc((size_t)block * nh * hd * sizeof(float), "spec queries");
+    float *kv = xmalloc((size_t)block * hd * sizeof(float), "spec kv");
+    mv8_rows(scratch, c->q_lora, &l->wq_a, x, dim, block);
+    for (int i = 0; i < block; i++)
+        rms_into(qr + (size_t)i * c->q_lora, scratch + (size_t)i * c->q_lora,
+                 l->q_norm.w, c->q_lora, c->norm_eps);
+    mv8_rows(q, nh * hd, &l->wq_b, qr, c->q_lora, block);
+    mv8_rows(scratch, hd, &l->wkv, x, dim, block);
+    for (int i = 0; i < block; i++) {
+        int pos = start_pos + main_rows + i;
+        for (int h = 0; h < nh; h++)
+            rope_apply(q + (size_t)i * nh * hd + (size_t)h * hd + hd - rd, rope, pos, rd, 0);
+        rms_into(kv + (size_t)i * hd, scratch + (size_t)i * hd, l->kv_norm.w, hd, c->norm_eps);
+        rope_apply(kv + (size_t)i * hd + hd - rd, rope, pos, rd, 0);
+    }
+
+    int filled = start_pos + main_rows;
+    int reach = win < filled ? win : filled;
+    int total = reach + block;
+    int *idx = xmalloc((size_t)total * sizeof(int), "spec indices");
+    for (int j = 0; j < reach; j++) idx[j] = j;
+    for (int j = 0; j < block; j++) idx[reach + j] = win + j;
+    float *kv_all = xmalloc((size_t)(win + block) * hd * sizeof(float), "spec kv all");
+    memcpy(kv_all, l->window, (size_t)win * hd * sizeof(float));
+    memcpy(kv_all + (size_t)win * hd, kv, (size_t)block * hd * sizeof(float));
+
+    float *heads = xmalloc((size_t)block * nh * hd * sizeof(float), "spec heads");
+    float *head_score = xmalloc((size_t)nh * total * sizeof(float), "spec scores");
+    float scale = 1.0f / sqrtf((float)hd);
+    for (int i = 0; i < block; i++) {
+        int pos = start_pos + main_rows + i;
+        float *row_heads = heads + (size_t)i * nh * hd;
+        #pragma omp parallel for schedule(static)
+        for (int h = 0; h < nh; h++)
+            sparse_attend(row_heads + (size_t)h * hd, q + (size_t)i * nh * hd + (size_t)h * hd,
+                          kv_all, idx, total, nh, hd, l->attn_sink.w[h], scale,
+                          head_score + (size_t)h * total);
+        for (int h = 0; h < nh; h++)
+            rope_apply(row_heads + (size_t)h * hd + hd - rd, rope, pos, rd, 1);
+    }
+    attn_project_out_rows(m, l, heads, block, out);
+    m->t_attn += now_s() - started;
+    free(head_score);
+    free(heads); free(kv_all); free(idx); free(kv); free(q); free(qr); free(scratch);
+}
+
+/* One DSpark round. `main_rows` positions have just been committed by the main model,
+ * starting at `start_pos`; `token` is the one it produced from the last of them.
+ *
+ * Returns how many drafts were written, 0 when there is nothing to draft from -- the
+ * prefill call, which exists only to fill the stages' rings from the prompt. */
+static int spec_step(Model *m, int token, int start_pos, int main_rows,
+                     int *draft, float *confidence) {
+    Cfg *c = &m->c;
+    Spec *sp = &m->spec;
+    if (!sp->active || !m->main_hidden || m->main_hidden_rows < main_rows) return 0;
+    int dim = c->dim, hc = c->hc_mult, block = c->spec_block;
+    int targets = c->n_spec_targets, rank = c->markov_rank, vocab = c->vocab;
+    double started = now_s();
+
+    float *scratch = xmalloc((size_t)dim * sizeof(float), "spec projection");
+    float *main_x = xmalloc((size_t)main_rows * dim * sizeof(float), "spec main input");
+    for (int t = 0; t < main_rows; t++) {
+        mv8(scratch, &sp->main_proj, m->main_hidden + (size_t)t * targets * dim);
+        rms_into(main_x + (size_t)t * dim, scratch, sp->main_norm.w, dim, c->norm_eps);
+    }
+    /* Seed only, no drafting: that is what a NULL draft buffer asks for. Until
+     * prefix reuse existed this was spelled `start_pos == 0`, because the only
+     * forward that ever started at position 0 was the prompt's. A prefill that
+     * resumes mid-sequence is the same call at a different position, and it has
+     * to seed the stages at THAT position -- writing the tail's keys into slots
+     * 0..rows-1 would leave the stages describing a sequence nobody fed. */
+    if (!draft) {
+        for (int stage = 0; stage < c->n_mtp; stage++)
+            spec_attention(m, stage, NULL, 0, start_pos, main_x, main_rows, NULL);
+        free(main_x); free(scratch);
+        return 0;
+    }
+    /* A cold run still declines to draft on the first decode step, where
+     * start_pos is still the prefill's 0 and the stages were seeded a moment
+     * ago. Kept separate from the guard above so this change does not move when
+     * a cold conversation starts drafting; a resumed one starts immediately,
+     * which costs a draft round's reads and can only change the acceptance
+     * rate, never a token -- every draft is verified before it is emitted. */
+    if (start_pos == 0) { free(main_x); free(scratch); return 0; }
+
+    float *h = xmalloc((size_t)block * hc * dim * sizeof(float), "spec streams");
+    for (int i = 0; i < block; i++) {
+        int id = i == 0 ? token : c->spec_noise;
+        const uint16_t *row = m->embed.w + (size_t)id * dim;
+        for (int copy = 0; copy < hc; copy++)
+            for (int j = 0; j < dim; j++)
+                h[((size_t)i * hc + copy) * dim + j] = bf16_to_f32(row[j]);
+    }
+    float *pre_mix = xmalloc((size_t)block * hc * sizeof(float), "spec pre mix");
+    for (int i = 0; i < block; i++)
+        for (int copy = 0; copy < hc; copy++) pre_mix[(size_t)i * hc + copy] = copy == 0 ? 1.0f : 0.0f;
+
+    float *branch_in = xmalloc((size_t)block * dim * sizeof(float), "spec sublayer in");
+    float *branch_out = xmalloc((size_t)block * dim * sizeof(float), "spec sublayer out");
+    float *residual = xmalloc((size_t)block * hc * dim * sizeof(float), "spec residual");
+    float *pre = xmalloc((size_t)block * hc * sizeof(float), "spec hc pre");
+    float *post = xmalloc((size_t)block * hc * sizeof(float), "spec hc post");
+    float *comb = xmalloc((size_t)block * hc * hc * sizeof(float), "spec hc comb");
+    float *collapsed = xmalloc((size_t)dim * sizeof(float), "spec collapsed");
+
+    for (int stage = 0; stage < c->n_mtp; stage++) {
+        Layer *l = &sp->stage[stage];
+        memcpy(residual, h, (size_t)block * hc * dim * sizeof(float));
+        for (int i = 0; i < block; i++) {
+            hc_mixes(m, l->hc_attn_fn.w, l->hc_attn_scale.w, l->hc_attn_base.w,
+                     h + (size_t)i * hc * dim, pre + (size_t)i * hc,
+                     post + (size_t)i * hc, comb + (size_t)i * hc * hc);
+            const float *mix = pre_mix + (size_t)i * hc;
+            for (int j = 0; j < dim; j++) {
+                float sum = 0.0f;
+                for (int copy = 0; copy < hc; copy++)
+                    sum += mix[copy] * h[((size_t)i * hc + copy) * dim + j];
+                collapsed[j] = sum;
+            }
+            rms_into(branch_in + (size_t)i * dim, collapsed, l->attn_norm.w, dim, c->norm_eps);
+        }
+        spec_attention(m, stage, branch_in, block, start_pos, main_x, main_rows, branch_out);
+        for (int i = 0; i < block; i++)
+            coli_hc_post(h + (size_t)i * hc * dim, branch_out + (size_t)i * dim,
+                         residual + (size_t)i * hc * dim, post + (size_t)i * hc,
+                         comb + (size_t)i * hc * hc, hc, dim);
+        memcpy(pre_mix, pre, (size_t)block * hc * sizeof(float));
+
+        memcpy(residual, h, (size_t)block * hc * dim * sizeof(float));
+        for (int i = 0; i < block; i++) {
+            hc_mixes(m, l->hc_ffn_fn.w, l->hc_ffn_scale.w, l->hc_ffn_base.w,
+                     h + (size_t)i * hc * dim, pre + (size_t)i * hc,
+                     post + (size_t)i * hc, comb + (size_t)i * hc * hc);
+            const float *mix = pre_mix + (size_t)i * hc;
+            for (int j = 0; j < dim; j++) {
+                float sum = 0.0f;
+                for (int copy = 0; copy < hc; copy++)
+                    sum += mix[copy] * h[((size_t)i * hc + copy) * dim + j];
+                collapsed[j] = sum;
+            }
+            rms_into(branch_in + (size_t)i * dim, collapsed, l->ffn_norm.w, dim, c->norm_eps);
+        }
+        moe_run_at(m, l, &sp->cache[stage], "mtp", stage, c->spec_routed, c->spec_activated,
+                   branch_in, block, branch_out, 1);
+        for (int i = 0; i < block; i++)
+            coli_hc_post(h + (size_t)i * hc * dim, branch_out + (size_t)i * dim,
+                         residual + (size_t)i * hc * dim, post + (size_t)i * hc,
+                         comb + (size_t)i * hc * hc, hc, dim);
+        memcpy(pre_mix, pre, (size_t)block * hc * sizeof(float));
+    }
+
+    /* the head, then the Markov chain over the block: each position is biased by the
+     * token drafted for the one before it, which is the only thing tying the block
+     * together -- the stages saw the noise id at every position but the first */
+    float *final_x = xmalloc((size_t)block * dim * sizeof(float), "spec final");
+    float *logits = xmalloc((size_t)block * vocab * sizeof(float), "spec logits");
+    float *bias = xmalloc((size_t)vocab * sizeof(float), "spec markov bias");
+    float *embed = xmalloc((size_t)rank * sizeof(float), "spec markov embed");
+    float *joined = xmalloc((size_t)(dim + rank) * sizeof(float), "spec confidence input");
+    for (int i = 0; i < block; i++) {
+        const float *mix = pre_mix + (size_t)i * hc;
+        float *x = final_x + (size_t)i * dim;
+        for (int j = 0; j < dim; j++) {
+            float sum = 0.0f;
+            for (int copy = 0; copy < hc; copy++)
+                sum += mix[copy] * h[((size_t)i * hc + copy) * dim + j];
+            x[j] = sum;
+        }
+        rms_into(collapsed, x, sp->norm.w, dim, c->norm_eps);
+        mvb(logits + (size_t)i * vocab, &m->head, collapsed);
+    }
+    draft[0] = token;
+    for (int i = 0; i < block; i++) {
+        const uint16_t *row = sp->markov_embed.w + (size_t)draft[i] * rank;
+        for (int j = 0; j < rank; j++) embed[j] = bf16_to_f32(row[j]);
+        mvb(bias, &sp->markov_out, embed);
+        float *row_logits = logits + (size_t)i * vocab;
+        for (int v = 0; v < vocab; v++) row_logits[v] += bias[v];
+        draft[i + 1] = argmax(row_logits, vocab);     /* greedy: the drafts are verified */
+        memcpy(joined, final_x + (size_t)i * dim, (size_t)dim * sizeof(float));
+        memcpy(joined + dim, embed, (size_t)rank * sizeof(float));
+        float score = 0.0f;
+        mvb(&score, &sp->conf_proj, joined);
+        confidence[i] = score;
+    }
+    sp->rounds++;
+    m->t_spec += now_s() - started;
+    free(joined); free(embed); free(bias); free(logits); free(final_x);
+    free(collapsed); free(comb); free(post); free(pre); free(residual);
+    free(branch_out); free(branch_in); free(pre_mix); free(h);
+    free(main_x); free(scratch);
+    return block;
+}
+
+/* `spec_batch` dice che queste righe sono un lotto di verifica speculativa, e
+ * cambia il calcolo: schedule di pubblicazione per riga e buffer di rollback.
+ * `keep_rows` dice soltanto di TENERE i logit di ogni posizione invece della
+ * sola ultima, e non cambia niente altro. Erano lo stesso parametro, e usarlo
+ * per leggere il prefill faceva prendere a un prefill lo schedule del decode:
+ * righe diverse dell'indice, top-k diverso, numeri plausibili e sbagliati.
+ * Sul fixture minuscolo uscivano NaN, che e come si e visto. */
+static void forward_full(Model *m, const int *ids, int n, float *logits, int spec_batch,
+                         const float *image_rows, int image_at, int image_h, int image_w,
+                         const uint8_t *image_mask, int keep_rows);
+
+/* Fotografia dello stato e lettura del prefill, per il canale logprobs.
+ *
+ * Qui e piu semplice che su qwen36: questo motore e ad attenzione pura, quindi
+ * non c'e stato ricorrente da salvare. Riavvolgere vuol dire solo dichiarare
+ * che il prefisso tenuto e quello fotografato: le righe KV di quelle posizioni
+ * non sono state toccate da nessuno. Si salvano gli id e il vettore di logit
+ * finale, che e il predittore del primo token fresco. */
+static ColiPinPool g_pins;               /* piu scatti annidati, vedi pin_pool.h */
+static const float *g_pin_logit = NULL;
+static int    g_pin_use_logit = 0;
+
+static void v41_echo(const char *id, int pos, int token, const float *lo, int V, int k,
+                     Tok *tokenizer) {
+    char tail[1024]; coli_logprob_tail(tail, sizeof tail, lo, V, token, k);
+    char piece[512]; int n = tok_decode(tokenizer, &token, 1, piece, (int)sizeof(piece));
+    if (n < 0) n = 0;
+    printf("ECHO %s %d %d%s\n", id, n, pos, tail);
+    if (n > 0) fwrite(piece, 1, (size_t)n, stdout);
+    fputc('\n', stdout); fflush(stdout);
+}
+
+static void forward(Model *m, const int *ids, int n, float *logits) {
+    forward_full(m, ids, n, logits, 0, NULL, -1, 0, 0, NULL, 0);
+}
+
+static void forward_with_image(Model *m, const int *ids, int n, float *logits,
+                               const float *image_rows, int image_at, int image_h, int image_w,
+                               const uint8_t *image_mask) {
+    forward_full(m, ids, n, logits, 0, image_rows, image_at, image_h, image_w, image_mask, 0);
+}
+
+/* Several positions past the prompt, with one row of logits each: what a speculative
+ * step verifies its drafts with. Every piece of per-position state below -- the window
+ * ring's position map, the compressor's group slots, the indexer's reach, the index
+ * keys each row reads -- is written so that this is the same computation as the same
+ * tokens decoded one at a time, because a draft is only worth anything if accepting it
+ * is indistinguishable from having generated it. */
+static void forward_batch(Model *m, const int *ids, int n, float *logits) {
+    forward_full(m, ids, n, logits, 1, NULL, -1, 0, 0, NULL, 0);
+}
+
+#ifdef COLI_VULKAN
+#include "deepseek_v41_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
+#endif
+
+static void forward_full(Model *m, const int *ids, int n, float *logits, int spec_batch,
+                         const float *image_rows, int image_at, int image_h, int image_w,
+                         const uint8_t *image_mask, int keep_rows) {
+    Cfg *c = &m->c;
+    int dim = c->dim, hc = c->hc_mult;
+    int start_pos = m->pos;
+    /* The index-key schedule for a batched step: which layer publishes at each of its
+     * sub-steps. It has to be known before the layers run, because a layer that comes
+     * later in the stack still publishes before this layer's later rows read. */
+    m->pub_before = m->published_index_k;
+    m->pub_before_layer = m->published_index_layer;
+    m->pub_rows = 0;
+    /* Only the speculative verify batch is ever rolled back (spec_verify is its
+     * only caller), and only it may write the per-layer undo buffers. */
+    m->rollback_save = spec_batch;
+    /* Several positions at once is either the speculative verify batch, which
+     * needs this per-row schedule because its rows are consecutive decode steps,
+     * or a prefill, which reads its index owner's keys for the whole chunk. The
+     * condition used to be `start_pos > 0`, which picked out the speculative
+     * case only because a prefill always started at position 0. A prefill that
+     * resumes mid-sequence is many rows past position 0 and is still a prefill:
+     * given the decode schedule it reads a different layer's keys than the same
+     * positions read when they were prefilled cold, and picks a different
+     * index top-k. `spec_batch` is what actually distinguishes the two --
+     * spec_verify is its only caller. */
+    if (n > 1 && spec_batch) {
+        m->pub_layer = realloc(m->pub_layer, (size_t)n * sizeof(int));
+        if (!m->pub_layer) { fprintf(stderr, "OOM sizing the publish schedule\n"); exit(1); }
+        m->pub_rows = n;
+        for (int t = 0; t < n; t++) {
+            m->pub_layer[t] = -1;
+            for (int layer = 0; layer < c->n_layers; layer++)
+                if (layer_publishes(c, layer, start_pos + t)) m->pub_layer[t] = layer;
+        }
+    }
+    if (start_pos + n > c->max_positions) {
+        fprintf(stderr, "CONTEXT_EXCEEDED %d %d\n", start_pos + n, c->max_positions);
+        exit(1);
+    }
+    if (m->engram.active) engram_push(&m->engram, ids, n, image_mask);
+
+    float *h = xmalloc((size_t)n * hc * dim * sizeof(float), "residual streams");
+    float *embedded = xmalloc((size_t)dim * sizeof(float), "embedding row");
+    for (int t = 0; t < n; t++) {
+        const uint16_t *row = m->embed.w + (size_t)ids[t] * dim;
+        for (int i = 0; i < dim; i++) embedded[i] = bf16_to_f32(row[i]);
+        /* An image span carries the placeholder id at every position; what each one
+         * MEANS follows from the grid, exactly as image_processor.py lays it out:
+         *   [start] then h rows of (w image tokens + newline) then [end].
+         * The delimiters take learned embeddings, the image slots take the aligner's
+         * rows in order. Reconstructing it from the grid keeps the wire protocol at
+         * one IMAGE frame plus placeholders, with no parallel token-type channel to
+         * fall out of step with the ids. */
+        if (image_rows && m->vision && t >= image_at) {
+            int offset = t - image_at;
+            int span = 1 + (image_w + 1) * image_h + 1;
+            if (offset < span) {
+                const float *source = NULL;
+                if (offset == 0) source = m->vision->image_start.w;
+                else if (offset == span - 1) source = m->vision->image_end.w;
+                else {
+                    int inner = offset - 1;
+                    int row_index = inner / (image_w + 1), column = inner % (image_w + 1);
+                    source = column == image_w ? m->vision->image_newline.w
+                                               : image_rows + (size_t)(row_index * image_w + column) * dim;
+                }
+                memcpy(embedded, source, (size_t)dim * sizeof(float));
+            }
+        }
+        for (int copy = 0; copy < hc; copy++)
+            memcpy(h + ((size_t)t * hc + copy) * dim, embedded, (size_t)dim * sizeof(float));
+    }
+    free(embedded);
+    float *pre_mix = xmalloc((size_t)n * hc * sizeof(float), "pre mix");
+    for (int t = 0; t < n; t++)
+        for (int copy = 0; copy < hc; copy++) pre_mix[(size_t)t * hc + copy] = copy == 0 ? 1.0f : 0.0f;
+
+    /* V41_TRACE=2 follows the FIRST row instead of the last: on a speculative step
+     * that is the position the sequential decode would have run on its own, which is
+     * what a divergence has to be compared against. */
+    int trace_row = (g_trace >= 2 && n > 1) ? 0 : n - 1;
+    float *branch_in = xmalloc((size_t)n * dim * sizeof(float), "sublayer input");
+    float *branch_out = xmalloc((size_t)n * dim * sizeof(float), "sublayer output");
+    float *residual = xmalloc((size_t)n * hc * dim * sizeof(float), "residual copy");
+    float *pre = xmalloc((size_t)n * hc * sizeof(float), "hc pre");
+    float *post = xmalloc((size_t)n * hc * sizeof(float), "hc post");
+    float *comb = xmalloc((size_t)n * hc * hc * sizeof(float), "hc comb");
+    float *collapsed = xmalloc((size_t)dim * sizeof(float), "collapsed stream");
+
+    /* What the DSpark head reads: the attention input of its target layers, the hc
+     * copies averaged. Kept even when no draft head is loaded is pointless, so it is
+     * gated on the model actually having one. */
+    int targets = m->spec.active ? c->n_spec_targets : 0;
+    if (targets) {
+        m->main_hidden = realloc(m->main_hidden,
+                                 (size_t)n * targets * dim * sizeof(float));
+        if (!m->main_hidden) { fprintf(stderr, "OOM sizing the DSpark input\n"); exit(1); }
+        m->main_hidden_rows = n;
+    }
+
+    int rows_out = spec_batch || keep_rows;
+#ifdef COLI_VULKAN
+    /* the dense chain runs its layers on the device (every layer, or a partial chain's
+     * first N, the streams of every row then back here); 0: the CPU runs them all */
+    int chained = v41c_forward(m, h, pre_mix, n, start_pos, spec_batch, rows_out);
+    if (!chained) v41c_cpu_step(m, start_pos);
+#else
+    int chained = 0;
+#endif
+    for (int layer = chained; layer < c->n_layers; layer++) {
+        Layer *l = &m->L[layer];
+        if (l->engram_index >= 0) engram_run(m, layer, h, n, start_pos);
+        for (int k = 0; k < targets; k++) {
+            if (c->spec_targets[k] != layer) continue;
+            for (int t = 0; t < n; t++) {
+                float *dest = m->main_hidden + ((size_t)t * targets + k) * dim;
+                for (int i = 0; i < dim; i++) {
+                    float sum = 0.0f;
+                    for (int copy = 0; copy < hc; copy++)
+                        sum += h[((size_t)t * hc + copy) * dim + i];
+                    dest[i] = sum / (float)hc;
+                }
+            }
+        }
+
+        trace("stream", layer, h + (size_t)trace_row * hc * dim, hc * dim);
+        memcpy(residual, h, (size_t)n * hc * dim * sizeof(float));
+        for (int t = 0; t < n; t++) {
+            hc_mixes(m, l->hc_attn_fn.w, l->hc_attn_scale.w, l->hc_attn_base.w,
+                     h + (size_t)t * hc * dim, pre + (size_t)t * hc,
+                     post + (size_t)t * hc, comb + (size_t)t * hc * hc);
+            const float *mix = pre_mix + (size_t)t * hc;
+            for (int i = 0; i < dim; i++) {
+                float sum = 0.0f;
+                for (int copy = 0; copy < hc; copy++)
+                    sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
+                collapsed[i] = sum;
+            }
+            rms_into(branch_in + (size_t)t * dim, collapsed, l->attn_norm.w, dim, c->norm_eps);
+        }
+        trace("attn_in", layer, branch_in + (size_t)trace_row * dim, dim);
+        trace("attn_pre", layer, pre + (size_t)trace_row * hc, hc);
+        trace("attn_post", layer, post + (size_t)trace_row * hc, hc);
+        trace("attn_comb", layer, comb + (size_t)trace_row * hc * hc, hc * hc);
+        attention_run(m, layer, branch_in, n, start_pos, branch_out);
+        trace("attn_out", layer, branch_out + (size_t)trace_row * dim, dim);
+        for (int t = 0; t < n; t++)
+            coli_hc_post(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
+                         residual + (size_t)t * hc * dim, post + (size_t)t * hc,
+                         comb + (size_t)t * hc * hc, hc, dim);
+        /* the attention's own `pre` collapses the FFN input */
+        memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));
+
+        memcpy(residual, h, (size_t)n * hc * dim * sizeof(float));
+        for (int t = 0; t < n; t++) {
+            hc_mixes(m, l->hc_ffn_fn.w, l->hc_ffn_scale.w, l->hc_ffn_base.w,
+                     h + (size_t)t * hc * dim, pre + (size_t)t * hc,
+                     post + (size_t)t * hc, comb + (size_t)t * hc * hc);
+            const float *mix = pre_mix + (size_t)t * hc;
+            for (int i = 0; i < dim; i++) {
+                float sum = 0.0f;
+                for (int copy = 0; copy < hc; copy++)
+                    sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
+                collapsed[i] = sum;
+            }
+            rms_into(branch_in + (size_t)t * dim, collapsed, l->ffn_norm.w, dim, c->norm_eps);
+        }
+        /* Every position's FFN input is ready before any expert is read, which is
+         * what lets the block share both the reads and the matmuls. */
+        moe_run(m, layer, branch_in, n, branch_out);
+        if (trace_row >= 0 && trace_row < n) {
+            trace("ffn_in", layer, branch_in + (size_t)trace_row * dim, dim);
+            trace("ffn_out", layer, branch_out + (size_t)trace_row * dim, dim);
+        }
+        for (int t = 0; t < n; t++)
+            coli_hc_post(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
+                         residual + (size_t)t * hc * dim, post + (size_t)t * hc,
+                         comb + (size_t)t * hc * hc, hc, dim);
+        memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));   /* the FFN's, for the next block */
+    }
+
+    /* the last block's FFN mix collapses the stream one final time */
+    for (int t = rows_out ? 0 : n - 1; t < n; t++) {
+        const float *mix = pre_mix + (size_t)t * hc;
+        for (int i = 0; i < dim; i++) {
+            float sum = 0.0f;
+            for (int copy = 0; copy < hc; copy++)
+                sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
+            collapsed[i] = sum;
+        }
+        if (t == n - 1) trace("final", -1, collapsed, dim);
+        rms_into(branch_in, collapsed, m->norm.w, dim, c->norm_eps);
+        mvb(logits + (size_t)(rows_out ? t : 0) * c->vocab, &m->head, branch_in);
+    }
+    trace("logits", -1, logits + (size_t)(rows_out ? n - 1 : 0) * c->vocab, c->vocab);
+#ifdef COLI_VULKAN
+    {   /* DUMP=<path>: every logits row this forward computed, for the Vulkan gates */
+        static FILE *dump; static int dump_init;
+        if (!dump_init) { const char *d = getenv("DUMP"); dump_init = 1; if (d && *d) dump = fopen(d, "wb"); }
+        if (dump) { fwrite(logits, sizeof(float), (size_t)(rows_out ? n : 1) * c->vocab, dump); fflush(dump); }
+    }
+#endif
+
+    m->pos += n;
+    /* Recorded where the tokens entered the state, and only for the MAIN stream:
+     * the draft stages read this window and never write it, so a speculative
+     * round adds nothing here until spec_verify commits through forward_batch. */
+    if (image_rows || image_mask) kv_prefix_taint(&m->kvp);
+    kv_prefix_record(&m->kvp, ids, start_pos, n);
+    m->last_start = start_pos;
+    m->last_rows = n;
+    m->forwards++;
+    free(collapsed); free(comb); free(post); free(pre);
+    free(residual); free(branch_out); free(branch_in); free(pre_mix); free(h);
+}
+
+static int argmax(const float *values, int n) {
+    int best = 0;
+    for (int i = 1; i < n; i++) if (values[i] > values[best]) best = i;
+    return best;
+}
+
+/* ---------------------------------------------------------------- serve ---- */
+
+/* ---- several conversations at once (KV_SLOTS>1, serve_mux) -------------------
+ * Each conversation owns a V41Seq: every layer's window ring and its positions, its
+ * compressed KV, index keys and partial compressor group, the engram history, what
+ * an index source last published (its keys and the shared top-k), the candidate
+ * mask, where it stands and the record of the tokens it holds. v41_mux_bind trades
+ * the Model's set for a parked one. A decode step runs one forward over a row of each
+ * conversation (forward_rows): the hyper-connection mixes, the routed experts and the
+ * head once over all rows, the attention and the engram row by row, each with its
+ * own conversation bound (attention_run reads the cross-layer state from the Model,
+ * so it is bound whole: pointers, not copies). Nothing drafts. */
+static V41Seq *g_v41_mux_seq;   /* [slots]: the conversations the Model does not hold */
+static int g_v41_mux_cur;       /* the slot the Model holds, -1 when every one is parked */
+
+static void v41_seq_swap(Model *m, V41Seq *q) {
+#define V41_SWAP(T,a,b) do { T t_ = (a); (a) = (b); (b) = t_; } while (0)
+    for (int i = 0; i < m->c.n_layers; i++) {
+        Layer *l = &m->L[i];
+        V41_SWAP(float *, l->window, q->window[i]); V41_SWAP(int *, l->window_pos, q->window_pos[i]);
+        V41_SWAP(float *, l->ckv, q->ckv[i]); V41_SWAP(float *, l->ikey, q->ikey[i]);
+        V41_SWAP(float *, l->cstate_kv, q->cstate_kv[i]); V41_SWAP(float *, l->cstate_score, q->cstate_score[i]);
+    }
+    V41_SWAP(int, m->pos, q->pos); V41_SWAP(kv_prefix, m->kvp, q->kvp);
+    V41_SWAP(int32_t *, m->engram.history, q->history);
+    V41_SWAP(int, m->engram.history_len, q->history_len); V41_SWAP(int, m->engram.history_cap, q->history_cap);
+    V41_SWAP(const float *, m->published_index_k, q->published_index_k);
+    V41_SWAP(int, m->published_index_layer, q->published_index_layer);
+    V41_SWAP(int *, m->shared_topk, q->shared_topk);
+    V41_SWAP(int, m->shared_topk_rows, q->shared_topk_rows); V41_SWAP(int, m->shared_topk_width, q->shared_topk_width);
+    V41_SWAP(uint8_t *, m->candidates, q->candidates);
+    V41_SWAP(int, m->candidate_width, q->candidate_width); V41_SWAP(int, m->candidate_rows, q->candidate_rows);
+#undef V41_SWAP
+}
+static void v41_mux_bind(Model *m, int slot) {
+    if (g_v41_mux_cur == slot) return;
+    if (g_v41_mux_cur >= 0) v41_seq_swap(m, &g_v41_mux_seq[g_v41_mux_cur]);
+    if (slot >= 0) v41_seq_swap(m, &g_v41_mux_seq[slot]);
+    g_v41_mux_cur = slot;
+}
+/* A conversation's state of its own, as model_load gives the Model's and model_reset
+ * clears it; slot 0's place holds only the pointer arrays. */
+static void v41_seq_alloc(Model *m, V41Seq *q, int with_state) {
+    Cfg *c = &m->c; int hd = c->head_dim;
+    memset(q, 0, sizeof *q);
+    q->window = xcalloc((size_t)c->n_layers, sizeof(float *), "seq windows");
+    q->window_pos = xcalloc((size_t)c->n_layers, sizeof(int *), "seq window positions");
+    q->ckv = xcalloc((size_t)c->n_layers, sizeof(float *), "seq compressed kv");
+    q->ikey = xcalloc((size_t)c->n_layers, sizeof(float *), "seq index keys");
+    q->cstate_kv = xcalloc((size_t)c->n_layers, sizeof(float *), "seq compressor groups");
+    q->cstate_score = xcalloc((size_t)c->n_layers, sizeof(float *), "seq compressor scores");
+    q->published_index_layer = m->published_index_layer;
+    if (!with_state) return;
+    kv_prefix_alloc(&q->kvp, c->max_positions);
+    for (int i = 0; i < c->n_layers; i++) {
+        q->window[i] = xcalloc((size_t)c->window * hd, sizeof(float), "window ring");
+        q->window_pos[i] = xmalloc((size_t)c->window * sizeof(int), "window positions");
+        for (int k = 0; k < c->window; k++) q->window_pos[i][k] = -1;
+        int ratio = c->compress_ratio[i];
+        if (c->kv_source[i]) {
+            if (ratio > 1) {
+                q->cstate_kv[i] = xcalloc((size_t)ratio * hd, sizeof(float), "compressor group");
+                q->cstate_score[i] = xmalloc((size_t)ratio * hd * sizeof(float), "compressor scores");
+                for (int k = 0; k < ratio * hd; k++) q->cstate_score[i][k] = -INFINITY;
+            }
+            int slots = c->max_positions / (ratio > 0 ? ratio : 1);
+            q->ckv[i] = xcalloc((size_t)slots * hd, sizeof(float), "compressed kv");
+            q->ikey[i] = xcalloc((size_t)slots * c->index_head_dim, sizeof(float), "index keys");
+        }
+    }
+}
+
+/* One decode step of several conversations: row t is the token ids[t] of the
+ * conversation in slot slots[t], at its next position. The streams, their mixes,
+ * the routed experts and the head run once over the n rows; the engram and the
+ * attention run row by row with that row's conversation bound. The CPU kernels give
+ * a row the same bits whatever n is, so each conversation gets the logits it would
+ * alone: [n, V] into logits. */
+static void forward_rows(Model *m, const int *slots, const int *ids, int n, float *logits) {
+    Cfg *c = &m->c;
+    int dim = c->dim, hc = c->hc_mult;
+    int *pos = xmalloc((size_t)n * sizeof(int), "row positions");
+    for (int t = 0; t < n; t++) {
+        v41_mux_bind(m, slots[t]);
+        pos[t] = m->pos;
+        if (pos[t] + 1 > c->max_positions) { fprintf(stderr, "CONTEXT_EXCEEDED %d %d\n", pos[t] + 1, c->max_positions); exit(1); }
+        if (m->engram.active) engram_push(&m->engram, ids + t, 1, NULL);
+    }
+    m->rollback_save = 0; m->pub_rows = 0;
+    float *h = xmalloc((size_t)n * hc * dim * sizeof(float), "residual streams");
+    for (int t = 0; t < n; t++) {
+        const uint16_t *row = m->embed.w + (size_t)ids[t] * dim;
+        for (int i = 0; i < dim; i++) h[(size_t)t * hc * dim + i] = bf16_to_f32(row[i]);
+        for (int copy = 1; copy < hc; copy++)
+            memcpy(h + ((size_t)t * hc + copy) * dim, h + (size_t)t * hc * dim, (size_t)dim * sizeof(float));
+    }
+    float *pre_mix = xmalloc((size_t)n * hc * sizeof(float), "pre mix");
+    for (int t = 0; t < n; t++)
+        for (int copy = 0; copy < hc; copy++) pre_mix[(size_t)t * hc + copy] = copy == 0 ? 1.0f : 0.0f;
+    float *branch_in = xmalloc((size_t)n * dim * sizeof(float), "sublayer input");
+    float *branch_out = xmalloc((size_t)n * dim * sizeof(float), "sublayer output");
+    float *residual = xmalloc((size_t)n * hc * dim * sizeof(float), "residual copy");
+    float *pre = xmalloc((size_t)n * hc * sizeof(float), "hc pre");
+    float *post = xmalloc((size_t)n * hc * sizeof(float), "hc post");
+    float *comb = xmalloc((size_t)n * hc * hc * sizeof(float), "hc comb");
+    float *collapsed = xmalloc((size_t)dim * sizeof(float), "collapsed stream");
+    for (int layer = 0; layer < c->n_layers; layer++) {
+        Layer *l = &m->L[layer];
+        if (l->engram_index >= 0)
+            for (int t = 0; t < n; t++) { v41_mux_bind(m, slots[t]); engram_run(m, layer, h + (size_t)t * hc * dim, 1, pos[t]); }
+        memcpy(residual, h, (size_t)n * hc * dim * sizeof(float));
+        for (int t = 0; t < n; t++) {
+            hc_mixes(m, l->hc_attn_fn.w, l->hc_attn_scale.w, l->hc_attn_base.w,
+                     h + (size_t)t * hc * dim, pre + (size_t)t * hc,
+                     post + (size_t)t * hc, comb + (size_t)t * hc * hc);
+            const float *mix = pre_mix + (size_t)t * hc;
+            for (int i = 0; i < dim; i++) {
+                float sum = 0.0f;
+                for (int copy = 0; copy < hc; copy++) sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
+                collapsed[i] = sum;
+            }
+            rms_into(branch_in + (size_t)t * dim, collapsed, l->attn_norm.w, dim, c->norm_eps);
+        }
+        for (int t = 0; t < n; t++) {
+            v41_mux_bind(m, slots[t]);
+            attention_run(m, layer, branch_in + (size_t)t * dim, 1, pos[t], branch_out + (size_t)t * dim);
+        }
+        for (int t = 0; t < n; t++)
+            coli_hc_post(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
+                         residual + (size_t)t * hc * dim, post + (size_t)t * hc,
+                         comb + (size_t)t * hc * hc, hc, dim);
+        memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));
+        memcpy(residual, h, (size_t)n * hc * dim * sizeof(float));
+        for (int t = 0; t < n; t++) {
+            hc_mixes(m, l->hc_ffn_fn.w, l->hc_ffn_scale.w, l->hc_ffn_base.w,
+                     h + (size_t)t * hc * dim, pre + (size_t)t * hc,
+                     post + (size_t)t * hc, comb + (size_t)t * hc * hc);
+            const float *mix = pre_mix + (size_t)t * hc;
+            for (int i = 0; i < dim; i++) {
+                float sum = 0.0f;
+                for (int copy = 0; copy < hc; copy++) sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
+                collapsed[i] = sum;
+            }
+            rms_into(branch_in + (size_t)t * dim, collapsed, l->ffn_norm.w, dim, c->norm_eps);
+        }
+        moe_run(m, layer, branch_in, n, branch_out);
+        for (int t = 0; t < n; t++)
+            coli_hc_post(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
+                         residual + (size_t)t * hc * dim, post + (size_t)t * hc,
+                         comb + (size_t)t * hc * hc, hc, dim);
+        memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));
+    }
+    for (int t = 0; t < n; t++) {
+        const float *mix = pre_mix + (size_t)t * hc;
+        for (int i = 0; i < dim; i++) {
+            float sum = 0.0f;
+            for (int copy = 0; copy < hc; copy++) sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
+            collapsed[i] = sum;
+        }
+        rms_into(branch_in, collapsed, m->norm.w, dim, c->norm_eps);
+        mvb(logits + (size_t)t * c->vocab, &m->head, branch_in);
+    }
+    for (int t = 0; t < n; t++) {
+        v41_mux_bind(m, slots[t]);
+        kv_prefix_record(&m->kvp, ids + t, pos[t], 1);
+        m->pos = pos[t] + 1;
+        m->last_start = pos[t]; m->last_rows = 1;
+    }
+    m->forwards++;
+    free(pos); free(collapsed); free(comb); free(post); free(pre);
+    free(residual); free(branch_out); free(branch_in); free(pre_mix); free(h);
+}
+
+
+/* Every turn starts from a clean state: the window rings, the compressed caches, the
+ * compressor's partial group and the engram history all describe one sequence. Prefix
+ * reuse across turns is a later step (the KV here is four caches and a ring, not one
+ * tensor), and getting it wrong would be silent, so it is refused rather than faked. */
+static void model_reset(Model *m) {
+    Cfg *c = &m->c;
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        memset(l->window, 0, (size_t)c->window * c->head_dim * sizeof(float));
+        for (int k = 0; k < c->window; k++) l->window_pos[k] = -1;
+        int ratio = c->compress_ratio[i];
+        if (c->kv_source[i]) {
+            int slots = c->max_positions / (ratio > 0 ? ratio : 1);
+            memset(l->ckv, 0, (size_t)slots * c->head_dim * sizeof(float));
+            memset(l->ikey, 0, (size_t)slots * c->index_head_dim * sizeof(float));
+            if (ratio > 1) {
+                memset(l->cstate_kv, 0, (size_t)ratio * c->head_dim * sizeof(float));
+                for (int k = 0; k < ratio * c->head_dim; k++) l->cstate_score[k] = -INFINITY;
+            }
+        }
+    }
+    m->engram.history_len = 0;
+    m->published_index_k = NULL;
+    m->shared_topk_rows = m->shared_topk_width = 0;
+    m->pos = 0;
+#ifdef COLI_VULKAN
+    v41c_reset(m);   /* nothing on the device describes the new sequence */
+#endif
+    /* Paired with the reset on purpose: whoever drops the state must also forget
+     * what it was built from, or the two disagree in favour of the one nobody
+     * can check. */
+    kv_prefix_clear(&m->kvp);
+}
+
+static const ColiServeWireProfile v41_wire = {
+    .max_header_bytes = 511,
+    .max_payload_bytes = 1u << 24,
+    .max_tokens = 1 << 20,
+    .require_exact_lf = 1,
+    .require_finite_sampling = 1,
+};
+
+typedef struct { float p; int id; } SampleProb;
+static int sample_desc(const void *a, const void *b) {
+    float pa = ((const SampleProb *)a)->p, pb = ((const SampleProb *)b)->p;
+    return (pb > pa) - (pa > pb);
+}
+
+static int serve_sample(const float *logits, int vocab, float temperature, float top_p) {
+    if (temperature <= 0.0f) return argmax(logits, vocab);
+    SampleProb *rank = xmalloc((size_t)vocab * sizeof(SampleProb), "sampling");
+    float top = logits[0];
+    for (int i = 1; i < vocab; i++) if (logits[i] > top) top = logits[i];
+    double total = 0.0;
+    for (int i = 0; i < vocab; i++) {
+        float p = expf((logits[i] - top) / temperature);
+        total += p;
+        rank[i].p = p; rank[i].id = i;
+    }
+    qsort(rank, (size_t)vocab, sizeof(SampleProb), sample_desc);
+    double cut = (top_p > 0.0f && top_p < 1.0f) ? top_p * total : total, kept = 0.0;
+    int n = 0;
+    while (n < vocab && kept < cut) kept += rank[n++].p;
+    double draw = ((double)rand() / RAND_MAX) * kept, acc = 0.0;
+    int pick = rank[0].id;
+    for (int i = 0; i < n; i++) { acc += rank[i].p; if (acc >= draw) { pick = rank[i].id; break; } }
+    free(rank);
+    return pick;
+}
+
+/* The probability `serve_sample` would give this token: the same temperature, the same
+ * top-p truncation, zero if the token falls outside the kept set. A greedy drafter
+ * proposes with probability 1, so accepting with probability p(draft) is exactly the
+ * speculative-sampling rule, and on a rejection the residual distribution is this one
+ * with the rejected token removed -- which is what banning it in the row does. */
+static double spec_accept_prob(const float *logits, int vocab, float temperature,
+                               float top_p, int token) {
+    SampleProb *rank = xmalloc((size_t)vocab * sizeof(SampleProb), "spec sampling");
+    float top = logits[0];
+    for (int i = 1; i < vocab; i++) if (logits[i] > top) top = logits[i];
+    double total = 0.0;
+    for (int i = 0; i < vocab; i++) {
+        float p = expf((logits[i] - top) / temperature);
+        total += p;
+        rank[i].p = p; rank[i].id = i;
+    }
+    qsort(rank, (size_t)vocab, sizeof(SampleProb), sample_desc);
+    double cut = (top_p > 0.0f && top_p < 1.0f) ? top_p * total : total, kept = 0.0;
+    int n = 0;
+    while (n < vocab && kept < cut) kept += rank[n++].p;
+    double probability = 0.0;
+    for (int i = 0; i < n; i++) if (rank[i].id == token) { probability = rank[i].p / kept; break; }
+    free(rank);
+    return probability;
+}
+
+/* Undo the part of a speculative step that was not committed.
+ *
+ * Most of the state needs nothing: the window ring keeps the rejected keys but they
+ * carry positions ahead of every query that follows, the compressed rows sit past what
+ * any query can reach, and the compressor's group slots are addressed by position, so
+ * the token that really lands there overwrites the draft before the group closes.
+ * Three things are not self-healing: how far the sequence has got, the engram history,
+ * and the two slots a layer publishes to -- all three are set here to what they would
+ * be after decoding exactly the committed prefix. */
+static void spec_rollback(Model *m, int start_pos, int committed, int rows) {
+    Cfg *c = &m->c;
+    int hd = c->head_dim;
+    /* Newest first, so a slot two rows touched comes back to what it held before the
+     * first of them -- which is the value the committed prefix left there. */
+    for (int layer = 0; layer < c->n_layers; layer++) {
+        Layer *l = &m->L[layer];
+        for (int t = rows - 1; t >= committed; t--) {
+            int slot = (start_pos + t) % c->window;
+            memcpy(l->window + (size_t)slot * hd, l->ring_save + (size_t)t * hd,
+                   (size_t)hd * sizeof(float));
+            l->window_pos[slot] = l->ring_save_pos[t];
+            if (!l->cstate_save_kv) continue;
+            int group = l->cstate_save_slot[t];
+            memcpy(l->cstate_kv + (size_t)group * hd, l->cstate_save_kv + (size_t)t * hd,
+                   (size_t)hd * sizeof(float));
+            memcpy(l->cstate_score + (size_t)group * hd, l->cstate_save_score + (size_t)t * hd,
+                   (size_t)hd * sizeof(float));
+        }
+    }
+    m->pos = start_pos + committed;
+    m->last_rows = committed;
+#ifdef COLI_VULKAN
+    v41c_rollback(m, m->pos);   /* the dense chain's copies of the rejected rows go stale */
+#endif
+    if (m->engram.active && m->engram.history_len > m->pos) m->engram.history_len = m->pos;
+    /* The record follows the rollback for the same reason the engram history
+     * does: the rejected rows are no longer in the state, and a record that
+     * still claimed them would hand the next turn positions nothing holds. The
+     * ids below m->pos are the committed ones, so truncating is enough. */
+    if (m->kvp.len > m->pos) m->kvp.len = m->pos;
+    if (m->pub_rows > 0) {
+        const float *published = m->pub_before;
+        int layer = m->pub_before_layer;
+        for (int t = committed - 1; t >= 0; t--)
+            if (m->pub_layer[t] >= 0) {
+                layer = m->pub_layer[t];
+                published = m->L[layer].ikey;
+                break;
+            }
+        m->published_index_k = published;
+        m->published_index_layer = layer;
+    }
+    /* the index list the layers before the next index source read is the one for the
+     * last committed position, not for the first row of the batch */
+    if (m->shared_topk && m->shared_topk_width > 0 && m->shared_topk_rows > committed - 1) {
+        int keep = committed - 1;
+        if (keep > 0)
+            memmove(m->shared_topk, m->shared_topk + (size_t)keep * m->shared_topk_width,
+                    (size_t)m->shared_topk_width * sizeof(int));
+        m->shared_topk_rows = 1;
+    }
+}
+
+/* Verify a block of drafts in one forward. `ids[0]` is the token the main model
+ * produced and is always committed; `ids[1..n-1]` are the drafts, accepted while they
+ * agree with what this forward says. `logits` comes back holding the continuation of
+ * the last committed position, and the caches are rolled back to it, so the caller can
+ * carry on as if the accepted tokens had been decoded one at a time -- which, position
+ * by position, is what they were. */
+static int spec_verify(Model *m, const int *ids, int n, float *logits,
+                       float temperature, float top_p) {
+    int vocab = m->c.vocab, start_pos = m->pos;
+    float *rows = xmalloc((size_t)n * vocab * sizeof(float), "verification logits");
+    forward_batch(m, ids, n, rows);
+    int accepted = 0, rejected = -1;
+    while (accepted < n - 1) {
+        const float *row = rows + (size_t)accepted * vocab;
+        int proposed = ids[accepted + 1];
+        int ok;
+        if (temperature <= 0.0f) ok = argmax(row, vocab) == proposed;
+        else ok = (double)rand() / RAND_MAX
+                  < spec_accept_prob(row, vocab, temperature, top_p, proposed);
+        if (!ok) { rejected = proposed; break; }
+        accepted++;
+    }
+    memcpy(logits, rows + (size_t)accepted * vocab, (size_t)vocab * sizeof(float));
+    if (rejected >= 0 && temperature > 0.0f) logits[rejected] = -INFINITY;
+    spec_rollback(m, start_pos, accepted + 1, n);
+    free(rows);
+    return accepted;
+}
+
+/* Is it worth drafting right now? Drafting reads the stages' experts whether or not
+ * anything is accepted, so a run of refusals is a disk bill with no token to show for
+ * it. The window is the vendor-independent part of every speculative decoder: measure,
+ * pause, measure again. */
+static int spec_ready(Spec *sp) {
+    if (!sp->active) return 0;
+    if (sp->pause > 0) {
+        if (--sp->pause == 0) sp->window_prop = sp->window_acc = 0;
+        return 0;
+    }
+    /* Ten proposals, not twenty-four: a round on a streamed model costs
+     * seconds, so a window that needs five rounds to decide spends the whole
+     * turn deciding. Two rounds is enough to see an acceptance rate that is
+     * half of what it needs to be. */
+    if (sp->window_prop >= 10 &&
+        sp->window_acc * 100 < sp->window_prop * (uint64_t)sp->min_accept) {
+        if (v41_stats())
+            fprintf(stderr, "[v41] DSpark: %.0f%% of the last %llu drafts accepted "
+                            "(under %d%%), pausing for 64 tokens\n",
+                    100.0 * (double)sp->window_acc / (double)sp->window_prop,
+                    (unsigned long long)sp->window_prop, sp->min_accept);
+        sp->pause = 64;
+        sp->window_prop = sp->window_acc = 0;
+        return 0;
+    }
+    return 1;
+}
+
+static void serve_line(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    vfprintf(stdout, format, args);
+    va_end(args);
+    fflush(stdout);
+}
+
+/* --- the dashboard's four lines -------------------------------------------
+ * Same bytes colibri.c emits, so the gateway parses this engine like any other:
+ *   EMAP rows cols hex   the grid, after READY and STAT and after every turn
+ *   HITS rows cols hex   the experts a turn routed, after DONE next to PROF
+ *   PROF ...             wall, tokens, disk, wait, matmul, attention, head, forwards
+ * Rows are the MoE layers (every layer here), columns the routed experts. */
+static void serve_emap(Model *m) {
+    Cfg *c = &m->c;
+    int rows = c->n_layers, cols = c->n_routed;
+    char *hex = xmalloc((size_t)rows * cols * 2 + 1, "emap");
+    int w = 0;
+    for (int i = 0; i < rows; i++) {
+        LCache *cache = &m->cache[i];
+        for (int e = 0; e < cols; e++) {
+            int resident = 0;
+            for (int k = 0; k < cache->n; k++) if (cache->slot[k].eid == e) { resident = 1; break; }
+            int byte = resident << 6;    /* tier in bits 6-7; no usage counter here, heat 0 */
+#ifdef COLI_VULKAN
+            if (vkt_resident(i, e)) byte = 2 << 6;   /* on the Vulkan device */
+#endif
+            hex[w++] = "0123456789abcdef"[byte >> 4];
+            hex[w++] = "0123456789abcdef"[byte & 15];
+        }
+    }
+    hex[w] = 0;
+    serve_line("EMAP %d %d %s\n", rows, cols, hex);
+    free(hex);
+}
+
+static void serve_hits(Model *m) {
+    Cfg *c = &m->c;
+    int rows = c->n_layers, cols = c->n_routed, nb = (rows * cols + 7) / 8;
+    uint8_t *bitmap = xmalloc((size_t)nb, "hits bitmap");
+    memset(bitmap, 0, (size_t)nb);
+    int bit = 0;
+    for (int i = 0; i < rows; i++)
+        for (int e = 0; e < cols; e++, bit++)
+            if (m->ehit && m->ehit[i][e]) { bitmap[bit >> 3] |= (uint8_t)(1 << (bit & 7)); m->ehit[i][e] = 0; }
+    char *hex = xmalloc((size_t)nb * 2 + 1, "hits hex");
+    int w = 0;
+    for (int b = 0; b < nb; b++) {
+        hex[w++] = "0123456789abcdef"[bitmap[b] >> 4];
+        hex[w++] = "0123456789abcdef"[bitmap[b] & 15];
+    }
+    hex[w] = 0;
+    serve_line("HITS %d %d %s\n", rows, cols, hex);
+    free(hex); free(bitmap);
+}
+
+static int serve_eos(Model *m, const char *snap, int *ids, int cap) {
+    (void)m;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/config.json", snap);
+    FILE *f = fopen(path, "rb");
+    int n = 0;
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
+    char *text = xmalloc((size_t)size + 1, "config");
+    if (fread(text, 1, (size_t)size, f) == (size_t)size) {
+        text[size] = 0;
+        char *arena = NULL;
+        jval *root = json_parse(text, &arena);
+        if (root) {
+            jval *eos = json_get(root, "eos_token_id");
+            if (eos && eos->t == J_NUM && n < cap) ids[n++] = (int)eos->num;
+            else if (eos && eos->t == J_ARR)
+                for (int i = 0; i < eos->len && n < cap; i++) ids[n++] = (int)eos->kids[i]->num;
+            json_free(root); free(arena);
+        }
+    }
+    fclose(f); free(text);
+    return n;
+}
+
+/* max_tokens is a ceiling, as on V4 and Qwen (#1641). A score-only
+ * request may fill the context; generation needs at least one free position. */
+static int serve_budget(int prompt, int requested, int context, int logprobs) {
+    if (prompt < 1 || prompt > context) return -1;
+    int budget = requested > 0 ? requested : (logprobs > 0 ? 0 : 256);
+    int room = context - prompt;
+    if (budget > 0 && room == 0) return -1;
+    return budget < room ? budget : room;
+}
+
+/* When a request was accepted, and the counters then: DONE, PROF and the turn's
+ * stderr report its share. */
+typedef struct {
+    double turn_started, disk0, expert0, attn0, engram0;
+    uint64_t forwards0, hits0, miss0, ebytes0;
+    uint64_t mir_bytes0[V41_MIR_REPS], mir_reads0[V41_MIR_REPS];
+    int n_prompt, budget;
+} V41Req;
+
+/* A request's prompt into the state the Model holds: its tokens and image, the budget,
+ * the prefix reuse and the photos, ACCEPT, the prefill and its read-out. 1 with the
+ * logits after the prompt; 0 when the request ended here, its ERROR written and its
+ * command disposed. serve_loop and serve_mux start every request here. */
+static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
+                           float **pending_image, int *pending_h, int *pending_w, V41Req *rq) {
+    Cfg *c = &m->c;
+    double turn_started = now_s();
+    double disk0 = m->t_disk, expert0 = m->t_expert, attn0 = m->t_attn, engram0 = m->t_engram;
+    uint64_t forwards0 = m->forwards, hits0 = m->hits, miss0 = m->miss;
+    uint64_t ebytes0 = m->expert_bytes;
+    uint64_t mir_bytes0[V41_MIR_REPS], mir_reads0[V41_MIR_REPS];
+    for (int r = 0; r < V41_MIR_REPS; r++) {
+        mir_bytes0[r] = g_mir_bytes[r];
+        mir_reads0[r] = g_mir_nread[r];
+    }
+    int n_prompt = tok_encode(tokenizer, (const char *)cmd->payload,
+                              (int)cmd->payload_bytes, ids, c->max_positions + 1);
+    int budget = serve_budget(n_prompt, cmd->max_tokens, c->max_positions,
+                              cmd->logprobs);
+    if (budget < 0) {
+        char message[128];
+        snprintf(message, sizeof(message),
+                 "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
+                 n_prompt, cmd->max_tokens, c->max_positions);
+        coli_serve_write_error(stdout, cmd->id,
+                               n_prompt < 1 ? "EMPTY_PROMPT" : message);
+        coli_serve_command_dispose(cmd); return 0;
+    }
+    if (cmd->max_tokens > budget)
+        fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
+                        "raise CTX for longer answers\n",
+                cmd->max_tokens, budget, c->max_positions, n_prompt);
+    /* Decided BEFORE the reset, because the reset is what it decides about.
+     * A chat client resends the whole transcript every turn; if this prompt
+     * begins with the ids the state was built from, that state already IS
+     * the state at those positions, so only the tail is fed. Reuse is all or
+     * nothing -- nothing here can rewind four caches and a ring. An image
+     * refuses it outright: the placeholder ids describe the span but not the
+     * picture, and the span's offsets are computed against the whole prompt.
+     * COLI_KV_PREFIX=0 disables it, COLI_PREFIX_LOG=1 reports the decision. */
+    int reuse = 0;
+    if (n_prompt >= 1 && kv_prefix_on() && !(*pending_image))
+        reuse = kv_prefix_reuse(&m->kvp, ids, n_prompt);
+    /* La fotografia si prova sempre: copre anche il caso in cui lo stato
+     * vivo e gia il prompt, dove senza di essa il primo token fresco
+     * resterebbe senza predittore e quindi senza logprob. */
+    g_pin_use_logit = 0; g_pin_logit = NULL;
+    if (n_prompt >= 1 && !(*pending_image)) {
+        /* Il piu profondo degli scatti valido: con due livelli annidati
+         * (istruzioni, istruzioni+domanda) vince il secondo, e se le sue
+         * righe non ci sono piu si ripiega sul primo. */
+        int ps = coli_pin_best(&g_pins, ids, n_prompt);
+        while (ps >= 0) {
+            ColiPin *k = &g_pins.slot[ps];
+            if (kv_prefix_holds(&m->kvp, k->ids, k->len)) {
+                kv_prefix_clear(&m->kvp);
+                kv_prefix_record(&m->kvp, k->ids, 0, k->len);
+                reuse = k->len;
+                g_pin_logit = k->logit; g_pin_use_logit = k->logit != NULL;
+                coli_pin_touch(&g_pins, ps);
+                break;
+            }
+            k->len = 0;
+            ps = coli_pin_best(&g_pins, ids, n_prompt);
+        }
+    }
+    if (getenv("COLI_PREFIX_LOG")) {
+        if (reuse)
+            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
+                    reuse, n_prompt, 100.0 * reuse / n_prompt);
+        else
+            fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d%s%s%s\n",
+                    m->kvp.len, m->kvp.cap, n_prompt,
+                    m->kvp.tainted ? " tainted" : "",
+                    (*pending_image) ? " (image)" : "",
+                    kv_prefix_on() ? "" : " (off: set COLI_KV_PREFIX=1)");
+        fflush(stderr);
+    }
+    if (!reuse) model_reset(m);
+    coli_serve_write_accept(stdout, cmd->id, n_prompt);
+    float *aligned = NULL;
+    uint8_t *image_mask = NULL;
+    int image_at = -1, image_h = 0, image_w = 0;
+    if ((*pending_image) && m->vision && c->image_token_id >= 0) {
+        /* the span is the run of placeholder ids the gateway inserted */
+        for (int t = 0; t < n_prompt; t++)
+            if (ids[t] == c->image_token_id) { image_at = t; break; }
+        int ratio = c->vision_ratio;
+        image_h = ((*pending_h) + ratio - 1) / ratio;
+        image_w = ((*pending_w) + ratio - 1) / ratio;
+        int span = 1 + (image_w + 1) * image_h + 1;
+        int run = 0;
+        for (int t = image_at; t >= 0 && t < n_prompt && ids[t] == c->image_token_id; t++) run++;
+        if (image_at < 0 || run != span) {
+            fprintf(stderr, "[v41] image span is %d tokens, the %dx%d grid needs %d: "
+                            "answering without the image\n", run, image_h, image_w, span);
+            image_at = -1;
+        } else {
+            int rows = vision_tokens(c, (*pending_h), (*pending_w));
+            aligned = xmalloc((size_t)rows * c->dim * sizeof(float), "image rows");
+            double vision_started = now_s();
+            vision_forward(m, m->vision, (*pending_image), (*pending_h), (*pending_w), aligned);
+            fprintf(stderr, "[v41] image %dx%d patches -> %d rows in %.2fs\n",
+                    (*pending_h), (*pending_w), rows, now_s() - vision_started);
+            image_mask = xmalloc((size_t)n_prompt, "image mask");
+            memset(image_mask, 0, (size_t)n_prompt);
+            for (int t = image_at; t < image_at + span; t++) image_mask[t] = 1;
+        }
+    }
+    free((*pending_image)); (*pending_image) = NULL;
+    /* `reuse` is the ABSOLUTE position of the first fresh token: every cache
+     * here is position-indexed, so this has to be the real offset. */
+    int nfresh = n_prompt - reuse;
+    float *all = NULL;
+    int echoed = 0;   /* il prefill l'ha gia fatto il ramo della lettura */
+    if (cmd->logprobs > 0 && nfresh > 0 && !(*pending_image)) {
+        all = (float *)malloc((size_t)nfresh * (size_t)c->vocab * sizeof(float));
+        if (all) {
+            /* un prefill normale (spec_batch=0) che tiene tutte le righe */
+            forward_full(m, ids + reuse, nfresh, all, 0, NULL, -1, 0, 0, NULL, 1);
+            /* La posizione p predice il token p+1; il primo token fresco e
+             * predetto dalla fotografia. Cosi ogni token dell'opzione ha il
+             * suo logprob, anche se non e fra i primi k di nessuna classifica. */
+            if (g_pin_use_logit && g_pin_logit)
+                v41_echo(cmd->id, reuse, ids[reuse], g_pin_logit, c->vocab,
+                         cmd->logprobs, tokenizer);
+            for (int p = 0; p + 1 < nfresh; p++)
+                v41_echo(cmd->id, reuse + p + 1, ids[reuse + p + 1],
+                         all + (size_t)p * c->vocab, c->vocab, cmd->logprobs, tokenizer);
+            memcpy(logits, all + (size_t)(nfresh - 1) * c->vocab,
+                   (size_t)c->vocab * sizeof(float));
+            free(all);
+            echoed = 1;
+        }
+    }
+    if (!echoed)
+    forward_with_image(m, ids + reuse, n_prompt - reuse, logits, aligned,
+                       image_at, image_h, image_w, image_mask);
+    free(aligned); free(image_mask);
+    if (cmd->pin) {
+        coli_pin_pool_init(&g_pins, c->vocab);
+        if (coli_pin_store(&g_pins, ids, n_prompt, logits)) {
+            fprintf(stderr, "[PIN] scatto a %d token\n", n_prompt);
+            fflush(stderr);
+        }
+    }
+    rq->turn_started = turn_started; rq->disk0 = disk0; rq->expert0 = expert0; rq->attn0 = attn0;
+    rq->engram0 = engram0; rq->forwards0 = forwards0; rq->hits0 = hits0; rq->miss0 = miss0;
+    rq->ebytes0 = ebytes0; rq->n_prompt = n_prompt; rq->budget = budget;
+    memcpy(rq->mir_bytes0, mir_bytes0, sizeof mir_bytes0); memcpy(rq->mir_reads0, mir_reads0, sizeof mir_reads0);
+    return 1;
+}
+
+/* ---- several conversations at once (KV_SLOTS>1) ---------------------------------
+ * The gateway's cache slots, each a conversation with a state of its own (V41Seq). A
+ * SUBMIT on a free slot starts its request at once through v41_serve_start, on that
+ * slot's state: its prefix reuse and photos work as a lone serve's. Then every step
+ * picks the next token of each active request and runs one forward over a row of each
+ * (forward_rows). A request's frames are a lone request's; they interleave by id. As
+ * alone, STOP ends a request with DONE and CANCEL with ERROR CANCELLED. */
+typedef struct {
+    char id[COLI_SERVE_ID_CAP];
+    float temperature, top_p;
+    int logprobs, active, stop, cancel, limited, emitted;
+    float *logits;                /* the logits the next pick reads */
+    V41Req rq;
+} V41MuxReq;
+
+static void v41_mux_finish(Model *m, V41MuxReq *r) {
+    r->active = 0;
+    if (r->cancel) { coli_serve_write_error(stdout, r->id, "CANCELLED"); return; }
+    if (r->stop) r->limited = 0;
+    double wall = now_s() - r->rq.turn_started;
+    uint64_t turn_hits = m->hits - r->rq.hits0, turn_miss = m->miss - r->rq.miss0;
+    ColiServeDone done = {
+        r->emitted, wall > 0 ? r->emitted / wall : 0.0,
+        (turn_hits + turn_miss) ? 100.0 * turn_hits / (double)(turn_hits + turn_miss) : 0.0,
+        rss_gb(), r->rq.n_prompt, r->limited,
+    };
+    coli_serve_write_done(stdout, r->id, &done);
+    serve_line("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", wall, r->rq.n_prompt, r->emitted,
+               m->t_disk - r->rq.disk0, 0.0, m->t_expert - r->rq.expert0, m->t_attn - r->rq.attn0,
+               m->t_engram - r->rq.engram0, (unsigned long long)(m->forwards - r->rq.forwards0));
+    serve_hits(m);
+}
+
+/* The next token of an active request, as serve_loop picks and sends it: 1 with the
+ * token when the request goes on, 0 when it ended. */
+static int v41_mux_pick(Model *m, Tok *tokenizer, V41MuxReq *r, const int *eos_ids, int n_eos, int *tk_out) {
+    Cfg *c = &m->c;
+    if (r->cancel || r->stop || r->emitted >= r->rq.budget) { v41_mux_finish(m, r); return 0; }
+    int token = serve_sample(r->logits, c->vocab, r->temperature, r->top_p);
+    for (int i = 0; i < n_eos; i++) if (token == eos_ids[i]) { r->limited = 0; v41_mux_finish(m, r); return 0; }
+    char piece[512];
+    int written = tok_decode(tokenizer, &token, 1, piece, (int)sizeof(piece));
+    if (written > 0) {
+        if (r->logprobs > 0) {
+            char lp[1024];
+            coli_logprob_tail(lp, sizeof lp, r->logits, c->vocab, token, r->logprobs);
+            coli_serve_write_data_lp(stdout, r->id, piece, (size_t)written, lp);
+        } else coli_serve_write_data(stdout, r->id, piece, (size_t)written);
+    }
+    r->emitted++;
+    if (r->emitted >= r->rq.budget) { v41_mux_finish(m, r); return 0; }
+    *tk_out = token; return 1;
+}
+
+static void serve_mux(Model *m, Tok *tokenizer, const char *snap) {
+    Cfg *c = &m->c;
+    int n = g_v41_mux_slots, V = c->vocab, input_eof = 0;
+    int eos_ids[8];
+    int n_eos = serve_eos(m, snap, eos_ids, 8);
+    coli_serve_write_ready_caps(stdout, rss_gb(), m->vision ? "vision=1" : "vision=0");
+    serve_emap(m);
+    V41MuxReq *rq = xcalloc((size_t)n, sizeof *rq, "requests");
+    int *slots = xmalloc((size_t)n * sizeof(int), "rows"), *tok = xmalloc((size_t)n * sizeof(int), "tokens");
+    float *lo = xmalloc((size_t)n * V * sizeof(float), "step logits");
+    int *ids = xmalloc(((size_t)c->max_positions + 1) * sizeof(int), "prompt ids");
+    for (int i = 0; i < n; i++) rq[i].logits = xmalloc((size_t)V * sizeof(float), "logits");
+    float *pending_image = NULL;
+    int pending_h = 0, pending_w = 0;
+    unsigned long long steps = 0, nrows = 0;
+    fprintf(stderr, "[v41] serving %d conversations at once (KV_SLOTS)\n", n);
+    for (;;) {
+        int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        /* idle: wait for a command; decoding: take one only when one is there */
+        if (!input_eof && (!active || coli_serve_stdin_ready())) {
+            ColiServeCommand command;
+            ColiServeReadResult result = coli_serve_read_command(stdin, &v41_wire, &command);
+            if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) input_eof = 1;
+            else if (result == COLI_SERVE_READ_NOMEM) { coli_serve_write_error(stdout, command.id, "out of memory"); input_eof = 1; }
+            else if (result == COLI_SERVE_READ_BAD_REQUEST) {
+                if (command.kind == COLI_SERVE_COMMAND_SUBMIT) coli_serve_write_error(stdout, command.id, "bad submit header");
+                coli_serve_command_dispose(&command);
+            } else if (command.kind == COLI_SERVE_COMMAND_IMAGE) {
+                int patch_in = 3 * c->vision_patch * c->vision_patch;
+                uint64_t expected = (uint64_t)command.grid_h * command.grid_w * patch_in * sizeof(float);
+                if (!m->vision) coli_serve_write_error(stdout, command.id, "this container has no vision tower");
+                else if (command.grid_h < 1 || command.grid_w < 1 || command.payload_bytes != expected)
+                    coli_serve_write_error(stdout, command.id, "IMAGE payload does not match its grid");
+                else {
+                    if (pending_image) fprintf(stderr, "[v41] a second IMAGE replaced the first\n");
+                    free(pending_image);
+                    pending_image = (float *)coli_serve_command_take_payload(&command);
+                    pending_h = command.grid_h; pending_w = command.grid_w;
+                }
+                coli_serve_command_dispose(&command);
+            } else if (command.kind == COLI_SERVE_COMMAND_CANCEL || command.kind == COLI_SERVE_COMMAND_STOP) {
+                int found = 0;
+                for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].id, command.id)) {
+                    found = 1;
+                    if (command.kind == COLI_SERVE_COMMAND_STOP) rq[i].stop = 1; else rq[i].cancel = 1;
+                }
+                if (!found && command.kind == COLI_SERVE_COMMAND_CANCEL) coli_serve_write_error(stdout, command.id, "NOT_FOUND");
+                coli_serve_command_dispose(&command);
+            } else if (command.kind != COLI_SERVE_COMMAND_SUBMIT) {
+                coli_serve_command_dispose(&command);
+            } else if (command.slot < 0 || command.slot >= n || rq[command.slot].active) {
+                coli_serve_write_error(stdout, command.id, command.slot < 0 || command.slot >= n ? "invalid cache slot" : "SLOT_BUSY");
+                coli_serve_command_dispose(&command);
+            } else {
+                V41MuxReq *t = &rq[command.slot];
+                float *keep = t->logits;
+                memset(t, 0, sizeof *t); t->logits = keep;
+                snprintf(t->id, sizeof t->id, "%s", command.id);
+                t->temperature = command.temperature; t->top_p = command.top_p; t->logprobs = command.logprobs;
+                v41_mux_bind(m, command.slot);
+                if (v41_serve_start(m, tokenizer, &command, ids, t->logits, &pending_image, &pending_h, &pending_w, &t->rq)) {
+                    t->active = 1; t->limited = 1;
+                    coli_serve_command_dispose(&command);
+                }
+            }
+        }
+        active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        if (!active) { if (input_eof) break; continue; }
+        int S = 0, ended = 0;
+        for (int i = 0; i < n; i++) if (rq[i].active) {
+            int tk;
+            if (!v41_mux_pick(m, tokenizer, &rq[i], eos_ids, n_eos, &tk)) { ended = 1; continue; }
+            slots[S] = i; tok[S] = tk; S++;
+        }
+        if (S) {
+            forward_rows(m, slots, tok, S, lo);
+            steps++; nrows += (unsigned long long)S;
+            for (int s = 0; s < S; s++) memcpy(rq[slots[s]].logits, lo + (size_t)s * V, (size_t)V * sizeof(float));
+        }
+        if (ended) serve_emap(m);
+    }
+    fprintf(stderr, "[v41] KV_SLOTS=%d: %llu decode steps, %llu rows (%.2f a step)\n", n, steps, nrows,
+            steps ? (double)nrows / (double)steps : 0.0);
+    v41_mux_bind(m, 0);
+    for (int i = 0; i < n; i++) free(rq[i].logits);
+    free(rq); free(slots); free(tok); free(lo); free(ids); free(pending_image);
+}
+
+static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
+    if (g_v41_mux_slots > 1) { serve_mux(m, tokenizer, snap); return; }
+    Cfg *c = &m->c;
+    coli_serve_stdio_init();
+    int eos_ids[8];
+    int n_eos = serve_eos(m, snap, eos_ids, 8);
+    /* CAPS between READY and STAT: the gateway reads it in the handshake, so it
+     * knows the served modalities before the first request. m->vision is NULL
+     * for a text-only container and for a VL config whose tower is missing. */
+    coli_serve_write_ready_caps(stdout, rss_gb(), m->vision ? "vision=1" : "vision=0");
+    serve_emap(m);
+    float *logits = xmalloc((size_t)c->vocab * sizeof(float), "logits");
+    /* tok_encode stops at its output capacity: one extra id distinguishes
+     * a full, valid read-only prompt from a silently truncated one. */
+    int *ids = xmalloc(((size_t)c->max_positions + 1) * sizeof(int), "prompt ids");
+    float *pending_image = NULL;
+    int pending_h = 0, pending_w = 0;
+
+    for (;;) {
+        ColiServeCommand command;
+        ColiServeReadResult result = coli_serve_read_command(stdin, &v41_wire, &command);
+        if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) break;
+        if (result == COLI_SERVE_READ_NOMEM) {
+            coli_serve_write_error(stdout, command.id, "out of memory"); break; }
+        if (result == COLI_SERVE_READ_BAD_REQUEST) {
+            if (command.kind == COLI_SERVE_COMMAND_SUBMIT)
+                coli_serve_write_error(stdout, command.id, "bad submit header");
+            coli_serve_command_dispose(&command);
+            continue;
+        }
+        if (command.kind == COLI_SERVE_COMMAND_IMAGE) {
+            /* One image waits for the SUBMIT that names it. A second one before that
+             * SUBMIT replaces the first and says so: answering about the wrong photo
+             * is worse than refusing. */
+            if (!m->vision) {
+                coli_serve_write_error(stdout, command.id, "this container has no vision tower");
+                coli_serve_command_dispose(&command);
+                continue;
+            }
+            int patch_in = 3 * c->vision_patch * c->vision_patch;
+            uint64_t expected = (uint64_t)command.grid_h * command.grid_w * patch_in * sizeof(float);
+            if (command.grid_h < 1 || command.grid_w < 1 || command.payload_bytes != expected) {
+                coli_serve_write_error(stdout, command.id, "IMAGE payload does not match its grid");
+                coli_serve_command_dispose(&command);
+                continue;
+            }
+            if (pending_image) fprintf(stderr, "[v41] a second IMAGE replaced the first\n");
+            free(pending_image);
+            pending_image = (float *)coli_serve_command_take_payload(&command);
+            pending_h = command.grid_h; pending_w = command.grid_w;
+            coli_serve_command_dispose(&command);
+            continue;
+        }
+        if (command.kind != COLI_SERVE_COMMAND_SUBMIT) {
+            /* CANCEL and STOP for a turn that is not running: the protocol's NOT_FOUND */
+            if (command.kind == COLI_SERVE_COMMAND_CANCEL)
+                coli_serve_write_error(stdout, command.id, "NOT_FOUND");
+            coli_serve_command_dispose(&command);
+            continue;
+        }
+        V41Req rq;
+        if (!v41_serve_start(m, tokenizer, &command, ids, logits, &pending_image, &pending_h, &pending_w, &rq)) continue;
+        double turn_started = rq.turn_started;
+        double disk0 = rq.disk0, expert0 = rq.expert0, attn0 = rq.attn0, engram0 = rq.engram0;
+        uint64_t forwards0 = rq.forwards0, hits0 = rq.hits0, miss0 = rq.miss0;
+        uint64_t ebytes0 = rq.ebytes0;
+        uint64_t mir_bytes0[V41_MIR_REPS], mir_reads0[V41_MIR_REPS];
+        memcpy(mir_bytes0, rq.mir_bytes0, sizeof mir_bytes0); memcpy(mir_reads0, rq.mir_reads0, sizeof mir_reads0);
+        int n_prompt = rq.n_prompt, budget = rq.budget;
+        uint64_t prefill_bytes = m->expert_bytes - ebytes0;
+        double prefill_disk = m->t_disk - disk0;
+        double prefill_expert = m->t_expert - expert0, prefill_wall = now_s() - turn_started;
+
+        int emitted = 0, limited = 1, cancelled = 0, done_early = 0;
+        char piece[512];
+        int block = m->spec.active ? c->spec_block : 0;
+        int *batch = block ? xmalloc((size_t)(block + 1) * sizeof(int), "draft batch") : NULL;
+        float *confidence = block ? xmalloc((size_t)block * sizeof(float), "draft confidence") : NULL;
+        uint64_t proposed0 = m->spec.proposed, accepted0 = m->spec.accepted;
+        /* the prompt seeds the draft head's windows; nothing is drafted from it */
+        if (m->spec.active) spec_step(m, 0, m->last_start, m->last_rows, NULL, NULL);
+        while (emitted < budget && !cancelled && !done_early) {
+            int token = serve_sample(logits, c->vocab, command.temperature, command.top_p);
+            int stop = 0;
+            for (int i = 0; i < n_eos; i++) if (token == eos_ids[i]) stop = 1;
+            if (stop) { limited = 0; break; }
+            int written = tok_decode(tokenizer, &token, 1, piece, (int)sizeof(piece));
+            if (written > 0) {
+                if (command.logprobs > 0) {
+                    /* La distribuzione da cui il token e stato estratto e ancora
+                     * quella in `logits`: serve_sample non la modifica. */
+                    char lp[1024];
+                    coli_logprob_tail(lp, sizeof lp, logits, c->vocab, token, command.logprobs);
+                    coli_serve_write_data_lp(stdout, command.id, piece, (size_t)written, lp);
+                } else coli_serve_write_data(stdout, command.id, piece, (size_t)written);
+            }
+            emitted++;
+            /* #1332: look at stdin once per token so a client that walked away stops
+             * paying for a turn nobody wants. A CANCEL aborts, a STOP ends it through
+             * the normal DONE path -- the two are not the same frame and must not
+             * share an outcome. */
+            while (coli_serve_stdin_ready()) {
+                ColiServeCommand control;
+                ColiServeReadResult inner = coli_serve_read_command(stdin, &v41_wire, &control);
+                if (inner == COLI_SERVE_READ_EOF) { done_early = 1; break; }
+                if (control.kind == COLI_SERVE_COMMAND_CANCEL &&
+                    !strcmp(control.id, command.id)) cancelled = 1;
+                else if (control.kind == COLI_SERVE_COMMAND_STOP &&
+                         !strcmp(control.id, command.id)) { limited = 0; done_early = 1; }
+                else if (control.kind == COLI_SERVE_COMMAND_SUBMIT)
+                    coli_serve_write_error(stdout, control.id, "SLOT_BUSY");
+                coli_serve_command_dispose(&control);
+            }
+            if (cancelled || done_early || emitted >= budget) break;
+
+            /* DSpark: draft the next few tokens, then verify them in ONE forward. What
+             * survives verification is emitted here; what does not costs the round its
+             * remaining drafts and nothing else, because the caches are rolled back to
+             * the last token that agreed. */
+            int drafted = spec_ready(&m->spec)
+                        ? spec_step(m, token, m->last_start, m->last_rows, batch, confidence) : 0;
+            if (m->spec.max_verify > 0 && drafted > m->spec.max_verify) drafted = m->spec.max_verify;
+            if (drafted > budget - emitted) drafted = budget - emitted;
+            if (drafted <= 0) { forward(m, &token, 1, logits); continue; }
+            batch[0] = token;
+            int accepted = spec_verify(m, batch, drafted + 1, logits,
+                                       command.temperature, command.top_p);
+            m->spec.proposed += (uint64_t)drafted;
+            m->spec.accepted += (uint64_t)accepted;
+            m->spec.window_prop += (uint64_t)drafted;
+            m->spec.window_acc += (uint64_t)accepted;
+            for (int i = 0; i < accepted; i++) {
+                int drafted_token = batch[1 + i];
+                int drafted_stop = 0;
+                for (int k = 0; k < n_eos; k++) if (drafted_token == eos_ids[k]) drafted_stop = 1;
+                if (drafted_stop) { limited = 0; done_early = 1; break; }
+                written = tok_decode(tokenizer, &drafted_token, 1, piece, (int)sizeof(piece));
+                if (written > 0) {
+                    if (command.logprobs > 0) {
+                        char lp[1024];
+                        coli_logprob_tail(lp, sizeof lp, logits, c->vocab, token, command.logprobs);
+                        coli_serve_write_data_lp(stdout, command.id, piece, (size_t)written, lp);
+                    } else coli_serve_write_data(stdout, command.id, piece, (size_t)written);
+                }
+                emitted++;
+            }
+        }
+        free(batch); free(confidence);
+        /* Per-turn accounting goes to stderr, and stderr is what the user reads
+         * their answer next to in `coli chat`: four lines a turn between the
+         * question and the reply is noise, not instrumentation. Off unless asked
+         * for, and the benches ask for it. */
+        int stats = v41_stats();
+        if (stats && m->engram.active) {
+            /* What the n-gram memory actually cost this turn. Rows are 264
+             * bytes and the traffic is Zipfian, so the useful question is not
+             * how many rows were read but how many of them the cache already
+             * had -- and, on a turn short enough that capacity cannot bind,
+             * what is left is pure repetition within the text. */
+            for (int t = 0; t < m->engram.n_layers; t++) {
+                EngramTable *tab = &m->engram.table[t];
+                uint64_t total = tab->hits + tab->misses;
+                fprintf(stderr, "[v41] engram table %d (layer %d): %llu lookups, "
+                                "%.0f%% cache hits, %llu rows read (%.1f MB)\n",
+                        t, m->engram.layer_of[t], (unsigned long long)total,
+                        total ? 100.0 * (double)tab->hits / (double)total : 0.0,
+                        (unsigned long long)tab->misses,
+                        tab->misses * (double)(m->engram.head_dim + m->engram.head_dim / 32) / 1e6);
+            }
+        }
+        if (stats) {
+            /* Expert streaming, per turn: how many bytes the LRU had to fetch and
+             * what rate the reads actually achieved. The rate is the number that
+             * matters -- the device is worth several GB/s, so a figure far under
+             * that says the loads are serialised, not that the disk is slow. */
+            uint64_t turn_bytes = m->expert_bytes - ebytes0;
+            double seconds = m->t_disk - disk0;
+            if (turn_bytes)
+                fprintf(stderr, "[v41] expert I/O: %llu misses, %.1f MB in %.2fs (%.2f GB/s); "
+                                "prefill %.1f MB, disk %.2fs, matmul %.2fs, wall %.2fs\n",
+                        (unsigned long long)(m->miss - miss0), turn_bytes / 1e6, seconds,
+                        seconds > 0 ? turn_bytes / 1e9 / seconds : 0.0,
+                        prefill_bytes / 1e6, prefill_disk, prefill_expert, prefill_wall);
+            /* Which drive answered, per turn. The split is the whole point of a
+             * mirror and the only honest way to check it is to count: a replica
+             * that was registered but never read from would look like a win in
+             * every number except the one that matters. */
+            if (turn_bytes) mirror_report(mir_bytes0, mir_reads0);
+        }
+        if (stats && m->spec.active && m->spec.proposed > proposed0)
+            fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn\n",
+                    (unsigned long long)(m->spec.accepted - accepted0),
+                    (unsigned long long)(m->spec.proposed - proposed0));
+        if (cancelled) {
+            coli_serve_write_error(stdout, command.id, "CANCELLED");
+            coli_serve_command_dispose(&command);
+            continue;
+        }
+        double wall = now_s() - turn_started;
+        uint64_t turn_hits = m->hits - hits0, turn_miss = m->miss - miss0;
+        ColiServeDone done = {
+            emitted, wall > 0 ? emitted / wall : 0.0,
+            (turn_hits + turn_miss) ? 100.0 * turn_hits / (double)(turn_hits + turn_miss) : 0.0,
+            rss_gb(), n_prompt, limited,
+        };
+        coli_serve_write_done(stdout, command.id, &done);
+        serve_line("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", wall, n_prompt, emitted,
+                   m->t_disk - disk0, 0.0, m->t_expert - expert0, m->t_attn - attn0,
+                   m->t_engram - engram0, (unsigned long long)(m->forwards - forwards0));
+#ifdef COLI_VULKAN
+        if (vkt_ready()) { vkt_report("turn", turn_hits, turn_miss); vk_tier_save(); }
+        v41c_report();   /* the dense chain's line, when it ran */
+#endif
+        serve_hits(m);
+        serve_emap(m);
+        coli_serve_command_dispose(&command);
+    }
+    free(ids); free(logits);
+}
+
+/* ----------------------------------------------------------------- main ---- */
+
+static int *load_ids(jval *root, const char *key, int *count) {
+    jval *array = json_get(root, key);
+    if (!array || array->t != J_ARR) { *count = 0; return NULL; }
+    int *out = xmalloc((size_t)array->len * sizeof(int), "reference ids");
+    for (int i = 0; i < array->len; i++) out[i] = (int)array->kids[i]->num;
+    *count = array->len;
+    return out;
+}
+
+/* One line at the end of a run with COLI_VULKAN=1: how many matmuls the device ran.
+ * coli_vk_matmul_calls() counts only calls that completed there, so a path that
+ * initialised and never ran cannot pass for one that did. */
+static void vk_report(void) {
+#ifdef COLI_VULKAN
+    if (!g_vk_ready) return;
+    size_t bytes = 0, tensors = 0;
+    coli_vk_mem_info(&bytes, &tensors);
+    fprintf(stderr, "[VK] deepseek_v41: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+    fprintf(stderr, "[VK] deepseek_v41: %zu resident matrices on the device, %.1f MiB "
+                    "(fp8 as fmt 12, bf16 as fmt 11)\n", tensors, bytes / 1048576.0);
+#endif
+}
+
+#ifdef COLI_VULKAN
+/* ---- the Vulkan routed-expert tier: start ----------------------------------------
+ * After the weights and the device. The experts sit in the slots as the checkpoint
+ * stores them, fp4 with a ue8m0 scale per 32 inputs (MXFP4_E8M0, fmt 7 on the
+ * device); the activation is the clamped SwiGLU. The history (.coli_usage, beside
+ * the container or COLI_USAGE) is kept only while the tier is on; it gives the warm
+ * start, read straight from the container in parallel. */
+static int vk_placed(const void *data) {   /* on the device already (the dense weights on the device only) */
+    if (!g_v41_dho) return 0;
+    V41Home *h = v41_home_of(data);
+    return h && h->gone;
+}
+static size_t vk_w8_bytes(const W8 *w) {   /* as the device holds it: fmt 12, an f32 per 32 inputs */
+    if (vk_placed(w->q)) return 0;
+    return w->q ? (size_t)w->O * w->I + (size_t)w->O * ((w->I + FP8_TILE - 1) / FP8_TILE) * 4 : 0;
+}
+static size_t vk_wb_bytes(const WB *w) { return w->w && !vk_placed(w->w) ? (size_t)w->O * w->I * 2 : 0; }
+/* The trunk the dense hook would put on the device, for the tier's budget. */
+static size_t vk_dense_bytes(Model *m) {
+    if (!coli_vk_dense() || g_v41_partial) return 0;   /* a partial chain: the per-matrix path uploads nothing new */
+    size_t b = vk_wb_bytes(&m->head);
+    for (int i = 0; i < m->c.n_layers; i++) {
+        Layer *L = &m->L[i];
+        const W8 *w8[] = {&L->wq_a, &L->wq_b, &L->wkv, &L->wo_a, &L->wo_b, &L->idx_wq_b,
+                          &L->sh_w1, &L->sh_w3, &L->sh_w2, &L->eng_wkv};
+        const WB *wb[] = {&L->comp_wkv, &L->comp_wgate, &L->idx_wk, &L->idx_wproj, &L->gate_w};
+        for (size_t k = 0; k < sizeof w8 / sizeof *w8; k++) b += vk_w8_bytes(w8[k]);
+        for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) b += vk_wb_bytes(wb[k]);
+    }
+    return b;
+}
+/* Is the expert in this layer's slots now (the tier's balance asks)? */
+static int vk_in_ram(void *ctx, int layer, int e) {
+    Model *m = ctx;
+    if (layer < 0 || layer >= m->c.n_layers + (m->spec.active ? m->c.n_mtp : 0)) return 0;
+    LCache *cache = layer < m->c.n_layers ? &m->cache[layer] : &m->spec.cache[layer - m->c.n_layers];   /* a DSpark stage's */
+    for (int i = 0; i < cache->n; i++) if (cache->slot[i].eid == e) return 1;
+    return 0;
+}
+static void vk_tier_start(Model *m, const char *snap, int cap) {
+    Cfg *c = &m->c;
+    if (!g_vk_ready || c->n_routed < 1 || !vkt_wanted()) return;
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    size_t expert = 0;
+    for (int part = 0; part < V41_EXPERT_TENSORS; part++) expert += (size_t)expert_part_bytes(c, part);
+    /* The DSpark stages (index n_layers + stage): their experts are the backbone's form,
+     * the tier's extra layers. By default on a discrete GPU only: on a GPU that shares
+     * the RAM, qwen38's head measured no faster there (docs/vulkan.md, "The MTP head's
+     * layer on the tier"); COLI_VK_TIER_MTP=1 or 0 decides. */
+    const char *tm = getenv("COLI_VK_TIER_MTP");
+    int want_mtp = tm && *tm ? *tm != '0' : !coli_vk_device_shares_ram();
+    int stages = want_mtp && m->spec.active && c->spec_routed <= c->n_routed && c->spec_activated <= MOE_TOPK_MAX ? c->n_mtp : 0;
+    VktConfig vc = {.engine = "deepseek_v41", .layers = c->n_layers, .experts = c->n_routed,
+                    .hidden = c->dim, .inter = c->moe_inter, .topk = c->n_activated,
+                    .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU, .act_limit = c->swiglu_limit,
+                    .extra_layers = stages, .extra_gate_up = f, .extra_down = f,
+                    .max_rows = MOE_ROW_CHUNK * c->n_activated,
+                    .ram_reserve = expert * (size_t)cap * (size_t)c->n_layers,
+                    .dense_bytes = vk_dense_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
+                    .load = vk_load, .release = vk_unhold, .load_ctx = m, .load_batch = vk_load_batch};
+    rt_init("deepseek_v41", c->n_layers, c->n_routed);
+    rt_drop_row(c->n_layers);   /* no MTP row: the history is the backbone's */
+    const char *up = getenv("COLI_USAGE");
+    if (up && *up) snprintf(g_vk_usage, sizeof g_vk_usage, "%s", up);
+    else snprintf(g_vk_usage, sizeof g_vk_usage, "%s/.coli_usage", snap);
+    int64_t h = rt_load(g_vk_usage);
+    if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n", (long long)h, g_vk_usage);
+    /* The device goes before the drivers unload, after the tier's teardown (atexit runs
+     * last-registered first), and whether or not the tier starts: vkt_init makes the
+     * expert batch's pipelines before it can refuse (no room), and a driver still
+     * compiling them at exit crashed one run in sixteen on Mesa's Dozen. */
+    atexit(coli_vk_shutdown);
+    if (!vkt_init(&vc, rt_counts_all())) { rt_destroy(); g_vk_usage[0] = 0; return; }
+    atexit(vkt_shutdown);
+    int all = c->n_layers * c->n_routed;
+    int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
+    const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
+    int n = pl && pe && !(warm && *warm == '0') ? vkt_plan(pl, pe, all) : 0;
+    if (n > 0) {
+        double t0 = now_s();
+        static const char *const part[V41_EXPERT_TENSORS] = {"w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale"};
+        #pragma omp parallel for schedule(dynamic, 4)
+        for (int i = 0; i < n; i++) {
+            uint8_t *buf = malloc(expert), *at = buf, *p[V41_EXPERT_TENSORS];
+            if (!buf) continue;
+            for (int k = 0; k < V41_EXPERT_TENSORS; k++) {
+                char name[160];
+                snprintf(name, sizeof name, "layers.%d.ffn.experts.%d.%s", pl[i], pe[i], part[k]);
+                st_read_raw_cap(&m->S, name, at, expert_part_bytes(c, k), 0);
+                p[k] = at; at += expert_part_bytes(c, k);
+            }
+            VktExpertSrc src = {p[0], p[2], p[4], p[1], p[3], p[5]};
+            vkt_put(pl[i], pe[i], &src);
+            free(buf);
+        }
+        vkt_put_done();
+        fprintf(stderr, "[VK] tier deepseek_v41: warm start, %d experts from the history in %.1fs\n", n, now_s() - t0);
+    }
+    free(pl); free(pe);
+}
+#endif
+
+int main(int argc, char **argv) {
+    /* Size the team to PHYSICAL cores before anything else touches the model.
+     * This engine issues ~720 OpenMP regions per decoded token -- three per
+     * expert application, 240 applications a token -- and every one of them is
+     * only a few thousand rows wide, so the barrier is a real share of the work
+     * rather than a rounding error. Left at the OpenMP default (one thread per
+     * logical CPU) the region cost dominates: on a 208-logical-CPU host 93% of
+     * all cycles land inside libgomp and the turn runs 18.7x slower than at 32
+     * threads and 11.7x slower than at the 104 physical cores this picks.
+     * colibri/inkling/kimi_k3/olmoe already call it; see
+     * docs/experiments/dsv41-omp-team-2026-09-15.md.
+     * OMP_NUM_THREADS still wins, COLI_NO_OMP_TUNE=1 still disables it. */
+    coli_omp_tune_threads("deepseek-v41");
+    const char *snap = getenv("SNAP");
+    if (!snap) { fprintf(stderr, "SNAP=<container dir> is required\n"); return 2; }
+    if (getenv("SERVE") && atoi(getenv("SERVE"))) {   /* KV_SLOTS: the conversations decoded at once */
+        const char *ks = getenv("KV_SLOTS");
+        if (ks && *ks) {
+            char *end = NULL; long v = strtol(ks, &end, 10);
+            if (end == ks || *end || v < 1 || v > 16) { fprintf(stderr, "KV_SLOTS must be between 1 and 16\n"); return 2; }
+            g_v41_mux_slots = (int)v;
+        }
+    }
+    int cap = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 8;
+    const char *ref_path = argc > 2 ? argv[2] : NULL;
+    int engram_rows = getenv("V41_ENGRAM_ROWS") ? atoi(getenv("V41_ENGRAM_ROWS")) : 65536;
+    g_trace = getenv("V41_TRACE") ? atoi(getenv("V41_TRACE")) : 0;
+
+    Model m;
+    memset(&m, 0, sizeof(m));
+    double started = now_s();
+    model_load(&m, snap, cap, engram_rows);
+    Cfg *c = &m.c;
+    fprintf(stderr, "[v41] %d layers, %d experts/layer (%d routed), dim %d, hc %d, "
+                    "window %d, engram %s — loaded in %.2fs\n",
+            c->n_layers, c->n_routed, c->n_activated, c->dim, c->hc_mult, c->window,
+            m.engram.active ? "on" : "off", now_s() - started);
+#ifdef COLI_VULKAN
+    /* After the weights, as in glm53: the device is an option, never a requirement.
+     * The matrices go up on their first multiply (see vk_mul), from this thread. */
+    if (!g_vk_opened) {          /* opened while the weights loaded when they may live on the device only */
+        g_vk_thread = pthread_self();
+        g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && c->n_routed > 0);
+        if (g_vk_ready) v41c_fit_now(&m);   /* how many layers the chain places, before any upload */
+        const char *keep = getenv("COLI_VK_DENSE_HOST");
+        if (g_vk_ready && keep && *keep && atoi(keep) != 0) {
+            coli_vk_dense_host_decide("deepseek_v41", v41_dense_on(&m, v41c_decide(&m)), v41_dho_bytes(&m, v41_dense_layers(&m)));
+            if (g_v41_fit.L > 0) coli_vk_dense_host_layers(v41_dense_layers(&m), c->n_layers);
+        }
+    }
+    if (g_v41_dho)
+        coli_vk_dense_host_placed("deepseek_v41", g_v41_dho_kept
+            ? "the embedding, the head, the router, norms and mixers, DSpark's stages, the vision tower; and matrices the device refused"
+            : "the embedding, the head, the router, norms and mixers, DSpark's stages, the vision tower");
+    v41c_start(&m);              /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
+    vk_tier_start(&m, snap, cap);
+    v41c_atexit();               /* after the tier's: the chain goes before the device */
+    if (g_vk_ready && !vkt_ready() && !coli_vk_dense())
+        coli_vk_dense_decide("deepseek_v41", 0, 1);   /* no tier after all: the trunk to the device */
+#endif
+
+    if (getenv("SERVE") && atoi(getenv("SERVE"))) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/tokenizer.json", snap);
+        Tok tokenizer;
+        tok_load(&tokenizer, path);
+        if (g_v41_mux_slots > 1) {   /* slot 0 is the Model's own state */
+            g_v41_mux_seq = xcalloc((size_t)g_v41_mux_slots, sizeof *g_v41_mux_seq, "conversations");
+            for (int i = 0; i < g_v41_mux_slots; i++) v41_seq_alloc(&m, &g_v41_mux_seq[i], i > 0);
+            g_v41_mux_cur = 0;
+        }
+        const char *seed = getenv("SEED");
+        srand(seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)time(NULL));
+        serve_loop(&m, &tokenizer, snap);
+        vk_report();
+#ifdef COLI_VULKAN
+        vkt_report("run", m.hits, m.miss);
+        vk_tier_save();
+#endif
+        return 0;
+    }
+    if (!ref_path) {
+        fprintf(stderr, "usage: SNAP=<dir> %s <cap> <ref.json>   (or SERVE=1 for the "
+                        "serve protocol)\n", argv[0]);
+        return 2;
+    }
+    FILE *f = fopen(ref_path, "rb");
+    if (!f) { fprintf(stderr, "%s: %s\n", ref_path, strerror(errno)); return 1; }
+    fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
+    char *text = xmalloc((size_t)size + 1, "reference");
+    if (fread(text, 1, (size_t)size, f) != (size_t)size) { fprintf(stderr, "short read\n"); return 1; }
+    text[size] = 0; fclose(f);
+    char *arena = NULL;
+    jval *root = json_parse(text, &arena);
+    if (!root) { fprintf(stderr, "%s is not valid JSON\n", ref_path); return 1; }
+    int n_prompt = 0, n_expected = 0;
+    int *prompt = load_ids(root, "prompt_ids", &n_prompt);
+    int *expected = load_ids(root, "output_ids", &n_expected);
+    if (!prompt || !expected) { fprintf(stderr, "%s lacks prompt_ids/output_ids\n", ref_path); return 1; }
+
+    /* the vision reference, when the fixture carries one: same patches in, the
+     * aligner's rows out, compared as floats rather than as tokens because nothing
+     * downstream of it is an argmax. */
+    jval *vision_ref = json_get(root, "vision");
+    int vision_failed = 0;
+    if (vision_ref && vision_ref->t == J_OBJ && m.vision) {
+        int n_h = (int)jnum(vision_ref, "grid_h", 0), n_w = (int)jnum(vision_ref, "grid_w", 0);
+        jval *patch_values = json_get(vision_ref, "patches");
+        jval *expected_values = json_get(vision_ref, "aligned");
+        int patch_in = 3 * c->vision_patch * c->vision_patch;
+        if (patch_values && expected_values && n_h > 0 && n_w > 0 &&
+            patch_values->len == n_h * n_w * patch_in) {
+            float *patches = xmalloc((size_t)patch_values->len * sizeof(float), "patches");
+            for (int i = 0; i < patch_values->len; i++) patches[i] = (float)patch_values->kids[i]->num;
+            int rows = vision_tokens(c, n_h, n_w);
+            float *aligned = xmalloc((size_t)rows * c->dim * sizeof(float), "aligned");
+            vision_forward(&m, m.vision, patches, n_h, n_w, aligned);
+            double worst = 0.0;
+            for (int i = 0; i < rows * c->dim && i < expected_values->len; i++) {
+                double delta = fabs(aligned[i] - expected_values->kids[i]->num);
+                if (delta > worst) worst = delta;
+            }
+            /* 2e-3: the reference rounds to five decimals in the JSON and both sides
+             * accumulate a 32-layer tower in fp32; a real divergence is orders larger. */
+            vision_failed = !(rows * c->dim == expected_values->len && worst < 2e-3);
+            fprintf(stderr, "[v41] vision: %d x %d patches -> %d rows, max |delta| %.2e%s\n",
+                    n_h, n_w, rows, worst, vision_failed ? "  MISMATCH" : "");
+            free(aligned); free(patches);
+        }
+    }
+
+    float *logits = xmalloc((size_t)c->vocab * sizeof(float), "logits");
+    double prefill_started = now_s();
+    forward(&m, prompt, n_prompt, logits);
+    if (m.spec.active) spec_step(&m, 0, m.last_start, m.last_rows, NULL, NULL);
+    double prefill = now_s() - prefill_started;
+
+    /* DSpark, when the fixture describes it. Two things are checked, and they are
+     * different things: that the draft head produces the vendor's block (the reference
+     * records one per step), and that a block VERIFIED in a single forward emits the
+     * same tokens as decoding them one at a time. The second is what makes accepting a
+     * draft safe, and a tiny fixture's random draft head never proposes anything worth
+     * accepting, so V41_SPEC_FORCE drafts the reference's own next tokens instead:
+     * 1 accepts the whole block, 2 corrupts the last draft so the round is rejected
+     * part way and the rollback runs. */
+    jval *spec_ref = json_get(root, "spec");
+    jval *spec_drafts = spec_ref && spec_ref->t == J_OBJ ? json_get(spec_ref, "drafts") : NULL;
+    jval *spec_conf = spec_ref && spec_ref->t == J_OBJ ? json_get(spec_ref, "confidence") : NULL;
+    int force = getenv("V41_SPEC_FORCE") ? atoi(getenv("V41_SPEC_FORCE")) : 0;
+    int block = m.spec.active ? c->spec_block : 0;
+    int *draft = block ? xmalloc((size_t)(block + 1) * sizeof(int), "drafts") : NULL;
+    float *confidence = block ? xmalloc((size_t)block * sizeof(float), "draft confidence") : NULL;
+    int spec_failed = 0, spec_checked = 0, round = 0;
+    uint64_t forced_prop = 0, forced_acc = 0, forced_rounds = 0;
+
+    int matched = 0;
+    double decode_started = now_s();
+    for (int step = 0; step < n_expected; ) {
+        int token = argmax(logits, c->vocab);
+        printf("%s%d", step ? " " : "", token);
+        if (token == expected[step]) matched++;
+        else fprintf(stderr, "\n[mismatch] step %d: got %d, reference %d\n", step, token, expected[step]);
+        step++;
+        if (step >= n_expected) break;
+
+        int one_at_a_time = m.last_rows == 1;
+        int drafted = m.spec.active
+                    ? spec_step(&m, token, m.last_start, m.last_rows, draft, confidence) : 0;
+        /* The reference drafts after every single-token forward. Once a round has been
+         * accepted the engine is a step ahead of that loop -- it committed several
+         * positions in one forward -- and its next block is a different, equally
+         * correct thing. Compare only where the two loops line up. */
+        if (drafted && one_at_a_time && spec_drafts && round < spec_drafts->len) {
+            jval *want = spec_drafts->kids[round];
+            jval *want_conf = spec_conf && round < spec_conf->len ? spec_conf->kids[round] : NULL;
+            for (int i = 0; i <= drafted && i < want->len; i++) {
+                int reference_id = (int)want->kids[i]->num;
+                if (draft[i] == reference_id) continue;
+                fprintf(stderr, "[dspark] round %d, draft %d: got %d, reference %d\n",
+                        round, i, draft[i], reference_id);
+                spec_failed = 1;
+            }
+            for (int i = 0; want_conf && i < drafted && i < want_conf->len; i++) {
+                double delta = fabs(confidence[i] - want_conf->kids[i]->num);
+                if (delta < 2e-3) continue;
+                fprintf(stderr, "[dspark] round %d, confidence %d: got %.5f, reference %.5f\n",
+                        round, i, confidence[i], want_conf->kids[i]->num);
+                spec_failed = 1;
+            }
+            spec_checked++;
+        }
+        if (drafted > 0 && one_at_a_time) round++;   /* the prefill call drafts nothing */
+
+        if (force && drafted > 0) {
+            if (m.spec.max_verify > 0 && drafted > m.spec.max_verify) drafted = m.spec.max_verify;
+            int room = n_expected - step;
+            if (drafted > room) drafted = room;
+            /* 3 keeps the head's own drafts, which is what serving does; 1 and 2 put
+             * the reference's tokens in their place so the verification path runs at
+             * full width even on a fixture whose draft head is random noise */
+            if (force != 3) {
+                for (int i = 0; i < drafted; i++) draft[1 + i] = expected[step + i];
+                /* 2 rejects the last draft, 4 the first -- every drafted row is
+                 * rolled back, which is what serving at 10-30% acceptance does most
+                 * of the time -- and 5 a different one each round */
+                int bad = force == 2 ? drafted : force == 4 ? 1
+                        : force == 5 ? 1 + (int)(forced_rounds % (uint64_t)drafted) : 0;
+                if (bad > 0 && drafted > 0)
+                    draft[bad] = (draft[bad] + 1) % c->vocab;             /* one bad draft */
+                forced_rounds++;
+            }
+        } else {
+            drafted = 0;                       /* the plain oracle decodes one at a time */
+        }
+        if (drafted > 0) {
+            draft[0] = token;
+            int accepted = spec_verify(&m, draft, drafted + 1, logits, 0.0f, 1.0f);
+            forced_prop += (uint64_t)drafted;
+            forced_acc += (uint64_t)accepted;
+            for (int i = 0; i < accepted && step < n_expected; i++) {
+                int drafted_token = draft[1 + i];
+                printf(" %d", drafted_token);
+                if (drafted_token == expected[step]) matched++;
+                else fprintf(stderr, "\n[mismatch] step %d: accepted draft %d, reference %d\n",
+                             step, drafted_token, expected[step]);
+                step++;
+            }
+        } else {
+            forward(&m, &token, 1, logits);
+        }
+    }
+    double decode = now_s() - decode_started;
+    printf("\n");
+    fprintf(stderr, "Matching tokens: %d/%d\n", matched, n_expected);
+    fprintf(stderr, "[v41] prefill %d tokens in %.2fs | decode %d in %.2fs (%.2f tok/s)\n",
+            n_prompt, prefill, n_expected, decode, n_expected / (decode > 0 ? decode : 1));
+    fprintf(stderr, "[v41] experts: %llu hits, %llu misses, %.1f MB read | disk %.2fs, "
+                    "expert matmul %.2fs, attention %.2fs, engram %.2fs\n",
+            (unsigned long long)m.hits, (unsigned long long)m.miss,
+            m.expert_bytes / 1e6, m.t_disk, m.t_expert, m.t_attn, m.t_engram);
+    mirror_report(NULL, NULL);
+    if (m.engram.active)
+        for (int t = 0; t < m.engram.n_layers; t++)
+            fprintf(stderr, "[v41] engram table %d (layer %d): %lld rows, %llu cache hits, "
+                            "%llu reads\n", t, m.engram.layer_of[t],
+                    (long long)m.engram.table[t].rows,
+                    (unsigned long long)m.engram.table[t].hits,
+                    (unsigned long long)m.engram.table[t].misses);
+    if (spec_checked)
+        fprintf(stderr, "[v41] DSpark: checked %d draft round%s against the reference%s\n",
+                spec_checked, spec_checked == 1 ? "" : "s", spec_failed ? "  MISMATCH" : "");
+    if (forced_prop)
+        fprintf(stderr, "[v41] DSpark: %llu of %llu forced drafts accepted, %d forwards "
+                        "for %d tokens\n", (unsigned long long)forced_acc,
+                (unsigned long long)forced_prop, (int)m.forwards, n_expected);
+    if (force && !forced_prop) {
+        fprintf(stderr, "[v41] V41_SPEC_FORCE is set but nothing was drafted: the "
+                        "verification path was NOT exercised\n");
+        spec_failed = 1;
+    }
+    vk_report();
+#ifdef COLI_VULKAN
+    vkt_report("run", m.hits, m.miss);
+    vk_tier_save();
+#endif
+    free(confidence); free(draft);
+    free(logits); free(prompt); free(expected); json_free(root); free(arena); free(text);
+    return (matched == n_expected && !vision_failed && !spec_failed) ? 0 : 1;
+}

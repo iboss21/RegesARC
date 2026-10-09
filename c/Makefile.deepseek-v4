@@ -1,0 +1,393 @@
+# DeepSeek V4 amalgamation build — x86-64/aarch64 Linux, Windows/MSYS2, and
+# arm64 macOS. (An earlier version of this header claimed GNU-ld --wrap as a
+# hard dependency; nothing here has used --wrap for a while, and macOS
+# portability rides compat.h: posix_fadvise -> F_RDADVISE, O_DIRECT ->
+# F_NOCACHE.) The parent Makefile gates COLI_V4_SUPPORTED.
+
+ifeq ($(OS),Windows_NT)
+IS_WIN := 1
+UNAME_S :=
+UNAME_M :=
+else
+IS_WIN :=
+UNAME_S := $(shell uname -s 2>/dev/null)
+UNAME_M := $(shell uname -m 2>/dev/null)
+# $(OS) is set by cmd.exe, but an MSYS2/MinGW login shell does not always export
+# it -- there uname reports MINGW64_NT-10.0-26200 / MSYS_NT-* / CYGWIN_NT-*,
+# which matched no branch below and tripped the $(error) on the very platform
+# the message lists as supported. Recognise those families as Windows too.
+#
+# Gated on x86_64 deliberately: the Windows arm below hardcodes ARCH ?= x86-64-v3,
+# so an ARM64 MinGW shell must NOT be routed there -- it would fail later with a
+# confusing -march error instead of the clear $(error) it gets today.
+ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(UNAME_S)))
+ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
+IS_WIN := 1
+UNAME_S :=
+UNAME_M :=
+endif
+endif
+endif
+
+COLI_V4_OK :=
+ifeq ($(IS_WIN),1)
+COLI_V4_OK := 1
+else ifeq ($(UNAME_S),Linux)
+ifneq (,$(filter x86_64 amd64 aarch64 arm64,$(UNAME_M)))
+COLI_V4_OK := 1
+endif
+else ifeq ($(UNAME_S),Darwin)
+ifneq (,$(filter arm64,$(UNAME_M)))
+COLI_V4_OK := 1
+endif
+endif
+
+ifneq ($(COLI_V4_OK),1)
+$(error Makefile.deepseek-v4 supports x86-64/aarch64 Linux, Windows/MSYS2, and arm64 macOS)
+endif
+
+ifneq ($(IS_WIN),)
+CC = gcc
+ARCH ?= x86-64-v3
+CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
+	-include pthread.h -Wall -Wextra -Wno-unused-parameter \
+	-Wno-misleading-indentation -Wno-unused-function \
+	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
+	-DCOLI_V4_PIN_RAMP_REQUESTS=24 \
+	-DCOLI_V4_GPU_TIER \
+	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+LDFLAGS = -lm -fopenmp -static -pthread
+V4_BINARY := deepseek_v4.exe
+V4_WIN_EXTRA_OBJS = backend_loader_dsv4.o
+else ifeq ($(UNAME_S),Darwin)
+# Apple clang has no bundled OpenMP runtime: use Homebrew libomp when its
+# artifacts are actually present, else build single-threaded (pragmas are
+# ignored). No -march: NEON is baseline on arm64 and the per-feature gates in
+# the sources do the rest. Mirrors the parent Makefile's Darwin block.
+CC = clang
+# An OMPDIR from the command line survives the assignments below; one from the
+# environment would be overwritten by them. Both are the user's choice: record
+# that first, and probe nothing for it.
+OMP_EXPLICIT := $(filter command line environment,$(origin OMPDIR))
+ifeq ($(OMP_EXPLICIT),)
+OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
+ifeq ($(OMPDIR),)
+OMPDIR := $(firstword $(wildcard /opt/homebrew/opt/libomp /usr/local/opt/libomp))
+endif
+endif
+ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
+OMPINC := $(OMPDIR)/include
+OMPLIB := $(OMPDIR)/lib
+else ifeq ($(OMP_EXPLICIT),)
+ifneq ($(and $(wildcard /opt/local/include/libomp/omp.h),$(wildcard /opt/local/lib/libomp/libomp.*)),)
+OMPINC := /opt/local/include/libomp
+OMPLIB := /opt/local/lib/libomp
+endif
+endif
+ifneq ($(OMPINC),)
+OMPC = -Xclang -fopenmp -I$(OMPINC)
+OMPL = -L$(OMPLIB) -lomp
+else
+$(warning libomp not found: building deepseek_v4 single-threaded. brew install libomp (or port install libomp))
+OMPC =
+OMPL =
+endif
+CFLAGS = -D_GNU_SOURCE -O3 $(OMPC) -pthread -include pthread.h \
+	-Wall -Wextra -Wno-unused-parameter \
+	-Wno-misleading-indentation -Wno-unused-function \
+	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
+	-DCOLI_V4_PIN_RAMP_REQUESTS=24 \
+	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+LDFLAGS = -lm $(OMPL) -pthread
+V4_BINARY := deepseek_v4
+else
+CC = gcc
+ARCH ?= native
+CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
+	-Wall -Wextra -Wno-unused-parameter \
+	-Wno-misleading-indentation -Wno-unused-function \
+	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
+	-DCOLI_V4_PIN_RAMP_REQUESTS=24 \
+	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+LDFLAGS = -lm -fopenmp -pthread
+V4_BINARY := deepseek_v4
+V4_WIN_EXTRA_OBJS =
+endif
+
+# Keep recursive builds (notably the parent test-asan target) instrumented.
+CFLAGS += $(EXTRA_CFLAGS)
+LDFLAGS += $(EXTRA_LDFLAGS)
+
+LTO ?= 1
+ifeq ($(LTO),1)
+CFLAGS += -flto
+LDFLAGS += -flto
+endif
+
+# ---- Linux/macOS CUDA tier (opt-in): CUDA=1 ---------------------------------
+# On Windows the tier lives in coli_cuda_dsv4*.dll, resolved at runtime by
+# backend_loader_dsv4.o. Elsewhere there is no loader: the same
+# backend_cuda_dsv4.cu is compiled by nvcc and linked straight into the
+# engine, so the dsv4_cuda_* symbols are the real ones. Defaults to the
+# GENERIC kernels (CUDA_ARCH=native|portable|portable-pre-ampere|sm_XX;
+# portable covers sm_80+, portable-pre-ampere adds sm_61/sm_75 and needs NO_TC=1);
+# DEEPGEMM=1 adds the sm_120a DeepGEMM tensor-core paths and needs the
+# patched sm120 DeepGEMM checkout at DEEPGEMM_HOME (see
+# patches-deepgemm-sm120-msvc.patch and docs/deepseek-v4.md). Untested here
+# (no Linux GPU box): built by inspection from the Windows tier.
+CUDA ?= 0
+ifeq ($(CUDA),1)
+ifeq ($(IS_WIN),)
+CUDA_HOME ?= /usr/local/cuda
+NVCC ?= $(CUDA_HOME)/bin/nvcc
+DEEPGEMM ?= 0
+ifeq ($(DEEPGEMM),1)
+# The DeepGEMM kernels use sm_120a-only PTX (block-scaled MMA); they cannot be
+# compiled for compute_120 or any other target, so DEEPGEMM=1 builds for
+# sm_120a only (CUDA_ARCH is ignored). Use the generic build for other cards.
+# Headers: a pinned checkout made by tools/fetch_deepgemm.sh on first build
+# (gitignored third_party/deepgemm); DEEPGEMM_HOME points at an existing tree.
+DEEPGEMM_HOME ?= third_party/deepgemm
+DEEPGEMM_PIN ?= 39fb4447a062b418fd08ce17cd308adb28559417
+DEEPGEMM_STAMP = $(DEEPGEMM_HOME)/deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh
+V4_DEEPGEMM_DEP = $(DEEPGEMM_STAMP)
+V4_CUDA_GENCODE = -gencode arch=compute_120a,code=sm_120a
+V4_DEEPGEMM_FLAGS = -DCOLI_DSV4_DEEPGEMM \
+                -I$(DEEPGEMM_HOME)/deep_gemm/include -I$(DEEPGEMM_HOME)/cutlass/include \
+                -I$(DEEPGEMM_HOME)/third-party/cutlass/include
+else
+CUDA_ARCH ?= native
+ifeq ($(CUDA_ARCH),portable)
+V4_CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 \
+                  -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 \
+                  -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120
+else ifeq ($(CUDA_ARCH),portable-pre-ampere)
+# Adds Pascal (sm_61) and Turing (sm_75) to the portable set. The generic
+# kernels do not need Ampere: bf16 appears only as storage (every use is
+# __bfloat162float / __float2bfloat16, and the compute is fp32), and fp8 is
+# weights are decoded through the 256-entry constant lookup table the engine
+# already carries -- not fp8 tensor-core MMA. The two activation-quantise
+# kernels in the generic build (fp8_sim64, fp8_sim64_dynamic) do call
+# __nv_cvt_float_to_fp8, but cuda_fp8.h resolves that to native cvt PTX only
+# at __CUDA_ARCH__ >= 890 and to its own software path below, so it builds
+# and runs on older silicon. All of it compiles for sm_61/sm_75 unchanged.
+#
+# Requires NO_TC=1: the DSV4_CUDA_TC path calls cuBLASLt block-scaling APIs
+# (CUBLASLT_MATMUL_DESC_A_SCALE_MODE and friends) that need CUDA >= 12.8, and
+# those are a TOOLKIT dependency rather than an architecture one.
+#
+# DEEPGEMM is unavailable here and cannot be made available: it calls
+# cuTensorMapEncodeTiled (TMA), a hardware unit introduced in sm_90, so there
+# is nothing to fall back to on older silicon.
+#
+# Deliberately stops at sm_90 rather than mirroring `portable` all the way to
+# sm_120: compute_120 needs CUDA >= 12.8, which is the very toolkit floor the
+# NO_TC=1 companion exists to stay below, so including it would make this
+# preset unbuildable by the toolkits its users are most likely to have. The
+# trailing compute_90 PTX keeps newer cards working through driver JIT.
+V4_CUDA_GENCODE = -gencode arch=compute_61,code=sm_61 -gencode arch=compute_75,code=sm_75 \
+                  -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 \
+                  -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 \
+                  -gencode arch=compute_90,code=compute_90
+else
+V4_CUDA_GENCODE = -arch=$(CUDA_ARCH)
+endif
+endif
+# NO_TC=1 adds -DCOLI_DSV4_NO_TC: builds on toolkits older than 12.8 that lack
+# the cuBLASLt block-scaling APIs (opt-in DSV4_CUDA_TC path is compiled out).
+NO_TC ?= 0
+ifeq ($(NO_TC),1)
+V4_DEEPGEMM_FLAGS += -DCOLI_DSV4_NO_TC
+endif
+V4_NVCCFLAGS = -O3 -std=c++20 --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=-fPIC \
+               $(V4_CUDA_GENCODE) $(V4_DEEPGEMM_FLAGS)
+CFLAGS += -DCOLI_V4_GPU_TIER
+V4_WIN_EXTRA_OBJS += backend_cuda_dsv4.o
+# libcuda (driver API, TMA descriptors) is linked from the toolkit stubs: the
+# driver package (and WSL2's /usr/lib/wsl/lib) ships libcuda.so.1 but often no
+# libcuda.so dev symlink. rpath so the binary finds the toolkit's libcudart /
+# libcublasLt without an ld.so.conf entry.
+LDFLAGS += -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -Wl,-rpath,$(CUDA_HOME)/lib64 \
+           -lcudart -lcuda -lcublasLt -lstdc++
+endif
+endif
+
+# ---- Vulkan (opt-in): VK=1 ---------------------------------------------------
+# The parent Makefile's VK=1, for this engine: -DCOLI_VULKAN, the backend object
+# and the SPIR-V shaders it loads at run time (COLI_VK_SHADERS, else shaders/ next
+# to the binary). `make deepseek-v4 VK=1` in the parent reaches here through
+# MAKEFLAGS. The object has its own name because the parent builds
+# backend_vulkan.o with its own CFLAGS while these carry -flto and the units'
+# flags stamp: one file written by two builds is #1702 again. Independent of
+# CUDA=1, whose tier keeps running first when both are built. vk_tier_v4.o is the
+# routed-expert tier (vk_tier.c) under the same rule, and expert_act*.spv are its
+# shaders (expert_act_v4.spv: DeepSeek V4's activation).
+VK ?= 0
+GLSLC ?= glslc
+V4_VK_OBJ =
+V4_VK_SPV =
+ifeq ($(VK),1)
+CFLAGS += -DCOLI_VULKAN
+# As in the parent: the loader is opened at run time (vk_load.h), never linked.
+ifeq ($(IS_WIN),)
+LDFLAGS += -ldl
+endif
+V4_VK_OBJ = backend_vulkan_v4.o vk_tier_v4.o
+V4_VK_SPV = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
+	shaders/attention_absorb.spv shaders/rmsnorm.spv \
+	shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv \
+	shaders/expert_act.spv shaders/expert_act_v4.spv
+# the dense chain (vk_chain.c, deepseek_v4_chain.h: COLI_VK_CHAIN) and its shaders
+V4_VK_OBJ += vk_chain_v4.o
+V4_VK_SPV += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv \
+	shaders/chain_dnconv.spv shaders/chain_dnrec.spv shaders/chain_ew.spv \
+	shaders/chain_qsa.spv shaders/chain_ple.spv shaders/chain_gemv.spv \
+	shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv \
+	shaders/chain_kda.spv shaders/chain_mhc.spv shaders/chain_dsv4.spv
+endif
+
+include Makefile.deepseek-v4.units
+
+TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
+TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
+V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
+V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
+V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ) $(V4_VK_OBJ)
+REGISTRY_OBJ = expert_store_registry.o
+V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
+V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
+
+# The objects are named after the unit, not after the flags they were built
+# with, and three builds share them: this engine (CUDA=1 adds
+# -DCOLI_V4_GPU_TIER), the parent's test-c (no GPU tier) and its test-asan
+# (EXTRA_CFLAGS). Timestamps cannot tell those apart, so make would report
+# "is up to date" and link one build's objects into another (#1702). The
+# compiler line is recorded here and rewritten only when it changes; every
+# object compiled with $(CFLAGS) depends on it. Same scheme as git's GIT-CFLAGS.
+V4_FLAGS_STAMP = deepseek_v4.cflags
+V4_TRACK_FLAGS = $(subst ','\'',$(CC) $(CFLAGS))
+$(V4_FLAGS_STAMP): FORCE
+	@flags='$(V4_TRACK_FLAGS)'; \
+	if test x"$$flags" != x"`cat $@ 2>/dev/null`"; then \
+		test -f $@ && echo "deepseek-v4: build flags changed, rebuilding the units" >&2; \
+		echo "$$flags" > $@; \
+	fi
+FORCE:
+
+# The same defect one level down. backend_cuda_dsv4.o is named after its source,
+# but what it contains comes from $(NVCC) $(V4_NVCCFLAGS): -arch=$(CUDA_ARCH)
+# (or the -gencode preset), the -DCOLI_DSV4_NO_TC guard and the DeepGEMM defines
+# all arrive through it. $(CFLAGS) above does not cover it, so without this:
+#
+#   make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=sm_86
+#   make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=sm_80
+#   -> no output at all, exit 0
+#
+# and the engine that asked for sm_80 links the sm_86 object, in silence. The
+# parent Makefile keeps the same class of state for the same reason, CUDA_ARCH
+# included, in .build-config (#306). Same scheme as $(V4_FLAGS_STAMP) above, so
+# a dry run (make -n) or a clean writes nothing: the file is only touched by the
+# recipe, and only when the command really changed.
+V4_CUDA_FLAGS_STAMP = deepseek_v4.cudaflags
+V4_TRACK_CUDA_FLAGS = $(subst ','\'',$(NVCC) $(V4_NVCCFLAGS))
+$(V4_CUDA_FLAGS_STAMP): FORCE
+	@flags='$(V4_TRACK_CUDA_FLAGS)'; \
+	if test x"$$flags" != x"`cat $@ 2>/dev/null`"; then \
+		test -f $@ && echo "deepseek-v4: CUDA build flags changed, rebuilding backend_cuda_dsv4.o" >&2; \
+		echo "$$flags" > $@; \
+	fi
+
+.PHONY: deepseek-v4 deepseek-v4-objs deepseek-v4-clean deepseek-v4-test-objs \
+	deepseek-v4-test-registry print-v4-objs FORCE
+deepseek-v4: $(V4_BINARY)
+
+# Build just the amalgamation unit + registry objects (no link). External
+# trees (e.g. a downstream integration) reuse these .o's to link an
+# alternative-backend deepseek_v4 binary without recompiling the units themselves.
+deepseek-v4-objs: $(V4_OBJS)
+
+# Echo the object list (target units + registry) for external linkers that need
+# to link exactly what the plain deepseek_v4 binary links, no more.
+print-v4-objs:
+	@echo $(V4_OBJS)
+
+$(V4_BINARY): $(V4_OBJS) $(V4_VK_SPV)
+	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
+
+# VK=1: the Vulkan backend compiled with this engine's flags, and the shaders.
+backend_vulkan_v4.o: backend_vulkan.c backend_vulkan.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+vk_tier_v4.o: vk_tier.c vk_tier.h backend_vulkan.h tier.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -c vk_tier.c -o $@
+vk_chain_v4.o: vk_chain.c vk_chain.h vk_alloc.h backend_vulkan.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -c vk_chain.c -o $@
+shaders/%.spv: shaders/%.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+# As in the parent: an older glslc keeps the committed cooperative-matrix .spv.
+shaders/qmatmul_coop.spv: shaders/qmatmul_coop.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+
+# Pluggable expert-store backend registry (standalone; not a deepseek_v4.c unit).
+# Linked into the binary so the engine can dispatch COLI_EXPERT_STORE backends.
+$(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h \
+	$(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -c expert_store_registry.c -o $@
+
+$(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
+	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
+	route_trace.h vk_tier.h deepseek_v4_chain.h vk_chain.h \
+	native_quant.h native_quant_batch.h native_quant_dual.h \
+	native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
+
+$(V4_HOT_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
+		st.h json.h compat.h tensor.h quant.h fp8_format.h route_trace.h sse41_kernels.h \
+		native_quant.h native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
+		-DCOLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 -c deepseek_v4.c -o $@
+
+$(V4_BATCH_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
+		tensor.h quant.h fp8_format.h native_quant.h native_quant_batch.h $(V4_FLAGS_STAMP) sse41_kernels.h
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
+		-DCOLI_V4_UNIT_NATIVE_QUANT_BATCH -c deepseek_v4.c -o $@
+
+COLI_V4_UNIT_GENERATE_STATS.o: serve_codec.h
+
+$(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c deepseek_v4.h \
+		deepseek_v4_internal.h serve_codec.h $(V4_SERVE_TEST_OBJS)
+	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
+
+# The CUDA tier loader object. Compiled only on Windows, where it is appended
+# to V4_OBJS and resolves the MSVC-built coli_cuda_dsv4.dll at runtime. On
+# Linux it is empty so the engine links without it.
+backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -c backend_loader_dsv4.c -o $@
+
+# Linux/macOS CUDA=1: the tier compiled straight into the engine.
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP) \
+	$(V4_CUDA_FLAGS_STAMP)
+	"$(NVCC)" $(V4_NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+
+ifneq ($(DEEPGEMM_STAMP),)
+$(DEEPGEMM_STAMP):
+	DEEPGEMM_HOME="$(DEEPGEMM_HOME)" tools/fetch_deepgemm.sh "$(DEEPGEMM_PIN)"
+endif
+
+deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
+
+# Registry unit test (no engine link — stubs the auto open fn).
+# -D_FILE_OFFSET_BITS=64: compat.h (setenv/unsetenv shims) requires it on Windows.
+deepseek-v4-test-registry: test_expert_store_registry
+	./test_expert_store_registry
+test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c \
+	expert_store_registry.h expert_store.h compat.h
+	$(CC) -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64 test_expert_store_registry.c expert_store_registry.c -o $@
+
+deepseek-v4-clean:
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
+		$(V4_BATCH_TEST_OBJ) \
+		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP) \
+		$(V4_CUDA_FLAGS_STAMP) backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o

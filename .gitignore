@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
+
+# Model weights never enter git. The store sits beside the checkout.
+RegesModels/
+*.safetensors
+*.gguf
+*.bin
+*.coli
+
+# Engine binaries and local toolchains
+engines/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# OS
+.DS_Store
+Thumbs.db

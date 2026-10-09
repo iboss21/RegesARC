@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""Create a deterministic, text-only Qwen4-Exp-shaped Qwen3.8 fixture.
+
+The fixture deliberately uses :class:`Qwen4ExpForCausalLM` (the upstream text
+class), rather than the multimodal ``Qwen4ExpForConditionalGeneration``
+wrapper.  Consequently its state-dict names start at ``model.embed_tokens``;
+the released multimodal checkpoint adds the extra ``model.language_model``
+prefix.  This keeps vision and MTP weights out while retaining the exact text
+module names (``layers.*.linear_attn``, ``layers.*.self_attn``, ``layers.*.ple``
+and ``layers.*.mlp``) an engine needs to support.  ``--mtp`` adds an MTP head
+under the release's ``mtp.*`` names (transformers has none; see _add_mtp).
+
+Usage::
+
+    python tools/make_qwen38_tiny.py --out ./qwen38_tiny
+
+Requires Transformers 5.16.1, the first release with Qwen4-Exp support.
+"""
+
+import argparse
+import hashlib
+import json
+import random
+import shutil
+import sys
+from pathlib import Path
+
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError):
+            pass
+
+try:
+    import torch
+except ImportError as exc:
+    sys.exit(f"Missing dependency: {exc}. Install torch and transformers.")
+
+
+TRANSFORMERS_VERSION = "5.16.1"
+SEED = 20260826
+
+
+def _classes():
+    try:
+        import transformers
+        from transformers import Qwen4ExpForCausalLM, Qwen4ExpTextConfig
+    except ImportError as exc:
+        sys.exit(
+            f"Missing Qwen4-Exp support. Install transformers=={TRANSFORMERS_VERSION}: {exc}"
+        )
+    if transformers.__version__ != TRANSFORMERS_VERSION:
+        sys.exit(
+            f"Qwen3.8 fixture generation requires transformers=={TRANSFORMERS_VERSION}; "
+            f"found {transformers.__version__}."
+        )
+    return transformers, Qwen4ExpForCausalLM, Qwen4ExpTextConfig
+
+
+def _digest(tensor):
+    data = tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+    return hashlib.sha256(data).hexdigest()
+
+
+def _reference(model, prompt_ids, max_new):
+    model.eval()
+    input_ids = torch.tensor([prompt_ids], dtype=torch.long)
+    with torch.no_grad():
+        prefill = model(
+            input_ids=input_ids,
+            use_cache=True,
+            output_hidden_states=True,
+            output_router_logits=True,
+        )
+        next_id = prefill.logits[:, -1:, :].argmax(dim=-1)
+        decode = model(
+            input_ids=next_id,
+            past_key_values=prefill.past_key_values,
+            use_cache=True,
+            output_hidden_states=True,
+            output_router_logits=True,
+        )
+        # Fixed-length greedy decode is intentional.  The seeded fixture emits
+        # EOS before max_new, and continuing through it exercises the PLE
+        # history reset that an ordinary generate() call would stop before.
+        generated = input_ids
+        current = input_ids
+        past = None
+        for _ in range(max_new):
+            step = model(input_ids=current, past_key_values=past, use_cache=True)
+            token = step.logits[:, -1:, :].argmax(dim=-1)
+            generated = torch.cat((generated, token), dim=1)
+            current = token
+            past = step.past_key_values
+
+    def summary(outputs):
+        logits = outputs.logits
+        hidden = outputs.hidden_states[-1] if outputs.hidden_states else None
+        return {
+            "logits_shape": list(logits.shape),
+            "logits_sha256": _digest(logits),
+            "last_logits_argmax": int(logits[:, -1, :].argmax(dim=-1).item()),
+            "last_hidden_shape": list(hidden.shape) if hidden is not None else None,
+            "last_hidden_sha256": _digest(hidden) if hidden is not None else None,
+            "router_layers": len(outputs.router_logits) if outputs.router_logits else 0,
+        }
+
+    full_ids = generated[0].tolist()
+    return {
+        "prefill": summary(prefill),
+        "decode": {"input_ids": next_id[0].tolist(), **summary(decode)},
+        "prompt_ids": prompt_ids,
+        "full_ids": full_ids,
+        "generated_ids": full_ids[len(prompt_ids) :],
+        # Token equality is necessary but not sufficient: retain the logits
+        # that predicted the final generated ID for a numeric C-engine gate.
+        "final_logits": step.logits[0, -1, :].float().cpu().tolist(),
+        "cache_class": type(prefill.past_key_values).__name__,
+    }
+
+
+FP8_BLOCK = 128
+FP8_E4M3_MAX = 448.0
+
+
+def _fp8_block_quant(w):
+    """Quantize a 2-D BF16/F32 matrix to e4m3 with one scale per 128x128 block,
+    the released checkpoint's layout (`weight_block_size [128, 128]`,
+    `weight_scale_inv` = the multiplier that restores the value). Returns
+    (e4m3 tensor, scale_inv tensor [ceil(O/128), ceil(I/128)], dequantized w).
+    The dequantized copy is what goes back into the model, so the reference
+    the fixture emits is the arithmetic of the bytes on disk."""
+    w32 = w.float()
+    O, I = w32.shape
+    nb_o, nb_i = (O + FP8_BLOCK - 1) // FP8_BLOCK, (I + FP8_BLOCK - 1) // FP8_BLOCK
+    scale_inv = torch.empty(nb_o, nb_i, dtype=torch.float32)
+    q = torch.empty(O, I, dtype=torch.float8_e4m3fn)
+    deq = torch.empty(O, I, dtype=torch.float32)
+    for bo in range(nb_o):
+        for bi in range(nb_i):
+            blk = w32[bo * FP8_BLOCK:(bo + 1) * FP8_BLOCK, bi * FP8_BLOCK:(bi + 1) * FP8_BLOCK]
+            amax = blk.abs().max().clamp(min=1e-12)
+            s = (amax / FP8_E4M3_MAX).item()
+            qb = (blk / s).to(torch.float8_e4m3fn)
+            q[bo * FP8_BLOCK:(bo + 1) * FP8_BLOCK, bi * FP8_BLOCK:(bi + 1) * FP8_BLOCK] = qb
+            deq[bo * FP8_BLOCK:(bo + 1) * FP8_BLOCK, bi * FP8_BLOCK:(bi + 1) * FP8_BLOCK] = qb.float() * s
+            scale_inv[bo, bi] = s
+    return q, scale_inv, deq
+
+
+def _fp8_experts_in_model(model):
+    """Fake-quantize every routed expert matrix in place (dequantized values
+    back into the BF16 parameters) and return {saved_name: (q, scale_inv)} for
+    the shard rewrite. In memory the experts are two fused parameters per
+    layer, `mlp.experts.gate_up_proj` [E, 2I, H] and `mlp.experts.down_proj`
+    [E, H, I]; save_pretrained splits them into the per-expert
+    `mlp.experts.<e>.{gate,up,down}_proj.weight` the release ships, so the
+    returned names are the saved ones. Shared expert, router and everything
+    dense stay BF16 like the release."""
+    packed = {}
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name.endswith(".mlp.experts.gate_up_proj"):
+                base = name[: -len("gate_up_proj")]              # ...mlp.experts.
+                E, twoI, H = param.shape; I = twoI // 2
+                for e in range(E):
+                    for kind, sl in (("gate_proj", slice(0, I)), ("up_proj", slice(I, twoI))):
+                        q, scale_inv, deq = _fp8_block_quant(param.data[e, sl, :])
+                        param.data[e, sl, :] = deq.to(param.dtype)
+                        packed[f"{base}{e}.{kind}.weight"] = (q, scale_inv)
+            elif name.endswith(".mlp.experts.down_proj"):
+                base = name[: -len("down_proj")]
+                E = param.shape[0]
+                for e in range(E):
+                    q, scale_inv, deq = _fp8_block_quant(param.data[e])
+                    param.data[e] = deq.to(param.dtype)
+                    packed[f"{base}{e}.down_proj.weight"] = (q, scale_inv)
+    if not packed:
+        raise RuntimeError("no routed expert parameters found to quantize")
+    return packed
+
+
+def _rewrite_shard_fp8(out: Path, packed):
+    """Replace the BF16 expert tensors in model.safetensors with e4m3 bytes and
+    BF16 `weight_scale_inv` sidecars, the way the release ships them. The
+    safetensors writer groups tensors by dtype and sorts by name inside a
+    group, which is what puts gate_proj.weight and up_proj.weight next to each
+    other -- the adjacency the engine's native FP8 path requires."""
+    from safetensors.torch import load_file, save_file
+    path = out / "model.safetensors"
+    tensors = load_file(str(path))
+    for name, (q, scale_inv) in packed.items():
+        assert name in tensors, name
+        tensors[name] = q.contiguous()
+        tensors[name + "_scale_inv"] = scale_inv.to(torch.bfloat16).contiguous()
+    # The release keeps a layer's gate/up expert tensors and its down_proj
+    # tensors in different shards. Because the writer sorts BF16 before F8 and
+    # by name within a dtype, that is what makes every layer's gate/up
+    # weight_scale_inv sidecars one compact byte range and the down sidecars
+    # another -- the invariant behind the engine's resident scale bank
+    # (q38_prepare_expert_scale_bank). One file would interleave
+    # down/gate/up per expert and silently send the engine down the
+    # per-matrix fallback, so the fixture ships two shards plus the index.
+    down = {k: v for k, v in tensors.items() if ".mlp.experts." in k and ".down_proj." in k}
+    rest = {k: v for k, v in tensors.items() if k not in down}
+    shards = {"model-00001-of-00002.safetensors": rest, "model-00002-of-00002.safetensors": down}
+    weight_map = {}
+    for fname, group in shards.items():
+        save_file(group, str(out / fname), metadata={"format": "pt"})
+        for k in group: weight_map[k] = fname
+    path.unlink()
+    (out / "model.safetensors.index.json").write_text(json.dumps(
+        {"metadata": {"total_size": sum(v.numel() * v.element_size() for v in tensors.values())},
+         "weight_map": weight_map}, indent=1), encoding="utf-8")
+    cfg_path = out / "config.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["quantization_config"] = {"quant_method": "fp8", "activation_scheme": "dynamic",
+                                  "weight_block_size": [FP8_BLOCK, FP8_BLOCK],
+                                  "fixture_note": "routed experts only, as in the release"}
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    print(f"fp8 experts: {len(packed)} matrices rewritten as F8_E4M3 + BF16 weight_scale_inv")
+
+
+MTP_SEED_OFFSET = 0x4D5450      # "MTP": the head's weights come from their own stream
+MTP_ROPE_THETA = 50000.0        # not the model's 10000, so a head on the wrong base shows
+
+
+def _add_mtp(out: Path, config, seed, fp8_experts=False, expert_gain=1.0):
+    """Add an MTP head with the release's tensor names to the saved fixture.
+
+    Transformers has no MTP module (it ignores ``mtp.*`` on load), so the head
+    is written here: random weights, drawn from a generator of their own after
+    the model is saved, so the model, its tensors and ref.json are exactly
+    those of the same fixture without ``--mtp``. The head's decoder layer has
+    the tensors of the model's last attention layer (``mtp.layers.0.*``, same
+    names after the layer prefix and same shapes); around it sit
+    ``pre_fc_norm_embedding`` [H], ``pre_fc_norm_hidden`` [hc_count*H],
+    ``fc_embedding`` and ``fc_hidden`` [H, H] and a ``hyper_connection_mixer``
+    shaped like the model's. Norm weights get small random values (the
+    model's are zero, Qwen4-Exp norms scale by 1+w) so a norm reading the
+    wrong slice of its weight shows. With ``fp8_experts`` the head's routed
+    experts are e4m3 with 128x128 block scales like the model's."""
+    from safetensors.torch import load_file, save_file
+    path = out / "model.safetensors"
+    tensors = load_file(str(path))
+    gen = torch.Generator().manual_seed(seed + MTP_SEED_OFFSET)
+    attn = [i for i, kind in enumerate(config.layer_types) if kind != "linear_attention"
+            and (i + 1) not in (config.ple_layer_ids or [])]
+    source = f"model.layers.{attn[-1]}."
+    std = config.initializer_range
+
+    def draw(shape, scale):
+        return (torch.randn(shape, generator=gen) * scale).to(torch.bfloat16)
+
+    head = {}
+    for name in sorted(k for k in tensors if k.startswith(source)):
+        shape = tuple(tensors[name].shape)
+        suffix = name[len(source):]
+        scale = 0.1 if len(shape) == 1 else std * (expert_gain if ".mlp.experts." in suffix else 1.0)
+        head["mtp.layers.0." + suffix] = draw(shape, scale)
+    H, W = config.hidden_size, config.hidden_size * config.hc_count
+    head["mtp.pre_fc_norm_embedding.weight"] = draw((H,), 0.1)
+    head["mtp.pre_fc_norm_hidden.weight"] = draw((W,), 0.1)
+    head["mtp.fc_embedding.weight"] = draw((H, H), 0.1)
+    head["mtp.fc_hidden.weight"] = draw((H, H), 0.1)
+    for name in sorted(k for k in tensors if k.startswith("model.hyper_connection_mixer.")):
+        shape = tuple(tensors[name].shape)
+        head["mtp." + name[len("model."):]] = draw(shape, 0.1 if len(shape) == 1 else std)
+    if fp8_experts:
+        for name in sorted(k for k in head if ".mlp.experts." in k):
+            q, scale_inv, _ = _fp8_block_quant(head[name])
+            head[name] = q.contiguous()
+            head[name + "_scale_inv"] = scale_inv.to(torch.bfloat16).contiguous()
+    tensors.update(head)
+    save_file(tensors, str(path), metadata={"format": "pt"})
+    cfg_path = out / "config.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["mtp_num_hidden_layers"] = 1
+    cfg["mtp"] = {"layer_types": ["full_attention"], "rope_theta": MTP_ROPE_THETA, "hybrid": True}
+    cfg["mtp_use_dedicated_embeddings"] = False
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    print(f"mtp head: {len(head)} tensors (decoder layer shaped like {source}*)")
+
+
+def _int4_experts_in_model(model, out: Path):
+    """Write the int4-g64 sidecar of the fixture just saved, with the converter
+    the real model goes through (tools/convert_qwen38_experts_int4.py), then read its bytes
+    back and put the dequantized experts into the model in place, in float32:
+    every int4 value (code times an f32 scale) is exact there, and the other
+    BF16 weights widen exactly, so the reference computed afterwards is the
+    arithmetic of the sidecar with nothing rounded on the way. In BF16 the
+    reference's own rounding would be larger than the gap it has to see."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import convert_qwen38_experts_int4 as int4
+    from safetensors.numpy import load_file
+    sidecar = Path(int4.convert(str(out), workers=1))
+    model.float()
+    stored = {}
+    for path in sorted(sidecar.glob("*.safetensors")):
+        stored.update(load_file(str(path)))
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name.endswith(".mlp.experts.gate_up_proj"):
+                base = name[: -len("gate_up_proj")]
+                E, twoI, H = param.shape; I = twoI // 2
+                parts = (("gate_proj", slice(0, I), H), ("up_proj", slice(I, twoI), H))
+            elif name.endswith(".mlp.experts.down_proj"):
+                base = name[: -len("down_proj")]
+                E, H, I = param.shape
+                parts = (("down_proj", slice(0, H), I),)
+            else:
+                continue
+            for e in range(E):
+                for kind, rows, cols in parts:
+                    key = f"{base}{e}.{kind}.weight"
+                    codes = int4.unpack_planar(stored[key], cols)
+                    values = int4.dequantize(codes, stored[key + ".qs"])
+                    param.data[e, rows, :] = torch.from_numpy(values)
+    print(f"int4 experts: {sidecar} written, the model now holds its dequantized values")
+
+
+def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_experts=False,
+          int4_experts=False, expert_gain=1.0, mtp=False, ple_layer=1):
+    if max_new < 1:
+        raise ValueError("max_new must be at least 1")
+    random.seed(seed)
+    torch.manual_seed(seed)
+    transformers, ModelCls, ConfigCls = _classes()
+
+    # Four layers exercise both token mixers; layer 0 is a PLE-enabled GDN
+    # layer and layers 1/3 are QSA layers.  All dimensions are intentionally
+    # small, but the relationships are the production relationships.
+    # --ple-layer moves the PLE (one-based, as the config counts it): the
+    # partial Vulkan chain's tests put it past the layers on the device.
+    if not 1 <= ple_layer <= 4:
+        raise ValueError("ple_layer must be in 1..4 (one-based)")
+    config = ConfigCls(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=128,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.5,
+        },
+        partial_rotary_factor=0.5,
+        layer_types=[
+            "linear_attention",
+            "qwen_sparse_attention",
+            "linear_attention",
+            "qwen_sparse_attention",
+        ],
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        hc_count=4,
+        hc_lowrank=8,
+        ngram_size=3,
+        heads_per_ngram=2,
+        ngram_vocab_size_base=31,
+        make_ngram_vocab_size_divisible_by=4,
+        split_ngram_parts=2,
+        ple_layer_ids=[ple_layer],  # one-based; layer 0 (GDN) by default
+        ple_embed_dim=32,
+        ple_conv_kernel_size=4,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=4,
+        indexer_budget=4,
+        indexer_compress_ratio=2,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=8,
+        shared_expert_intermediate_size=8,
+        norm_topk_prob=True,
+        output_gate_type="sigmoid",
+        attention_bias=False,
+        attention_dropout=0.0,
+        tie_word_embeddings=False,
+        use_cache=True,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    model = ModelCls(config)
+    # The released checkpoint is BF16.  Materialize the fixture in BF16 before
+    # saving so the digest emitted here is exactly reproducible after a
+    # save/load round trip (and follows the production arithmetic path).
+    model = model.to(dtype=torch.bfloat16)
+    model.eval()
+    if expert_gain != 1.0:
+        # At the default initialization the routed experts barely reach the
+        # logits: zeroing them all moves the final logits less than the
+        # oracle's tolerance (cosine 0.99994), so no end-to-end check can see
+        # their arithmetic. With a gain of 3 (applied before any quantization,
+        # so the scaled values simply are the fixture's experts) the int4
+        # fixture's FP8 and int4 references part after the third generated
+        # token, and the token gate itself tells one representation from the
+        # other. At 4 a routing near-tie flips between the C engine and the
+        # reference.
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if ".mlp.experts." in name:
+                    param.mul_(expert_gain)
+    packed = _fp8_experts_in_model(model) if fp8_experts else None
+    out.mkdir(parents=True, exist_ok=True)
+    # A sidecar left by an earlier run belongs to the weights it was converted
+    # from, and qwen38 picks it up by itself: regenerating the fixture drops it.
+    shutil.rmtree(out / "experts-int4g64", ignore_errors=True)
+    model.save_pretrained(str(out), safe_serialization=True)
+    if mtp:
+        _add_mtp(out, config, seed, fp8_experts=fp8_experts, expert_gain=expert_gain)
+    if packed:
+        _rewrite_shard_fp8(out, packed)
+
+    if prompt_ids is None:
+        prompt_ids = [1, 3, 4, 5, 6]
+    if not prompt_ids or any(token < 0 or token >= config.vocab_size for token in prompt_ids):
+        raise ValueError(f"prompt ids must be in [0, {config.vocab_size}) and non-empty")
+
+    payload = {
+        "schema_version": 2,
+        "model": "qwen38_tiny",
+        "seed": seed,
+        "transformers_version": transformers.__version__,
+        "text_only": True,
+        "fp8_experts": bool(fp8_experts),
+        **({"expert_gain": expert_gain} if expert_gain != 1.0 else {}),
+        "naming": "upstream Qwen4ExpForCausalLM (no model.language_model prefix)",
+        "config_summary": {
+            "hidden_size": config.hidden_size,
+            "num_hidden_layers": config.num_hidden_layers,
+            "layer_types": config.layer_types,
+            "ple_layer_ids": config.ple_layer_ids,
+            "num_experts": config.num_experts,
+            "num_experts_per_tok": config.num_experts_per_tok,
+            "tie_word_embeddings": config.tie_word_embeddings,
+        },
+    }
+    payload.update(_reference(model, prompt_ids, max_new))
+    if emit_ref:
+        ref_path = out / "ref.json"
+        ref_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"Reference written to {ref_path}")
+    if int4_experts:
+        _int4_experts_in_model(model, out)
+        payload["int4_experts"] = True
+        payload["reference_dtype"] = "float32"
+        payload.update(_reference(model, prompt_ids, max_new))
+        if emit_ref:
+            ref_path = out / "ref_int4.json"
+            ref_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            print(f"int4 reference written to {ref_path}")
+    print(f"Tiny Qwen3.8 fixture written to {out}")
+    print(f"prompt_ids={payload['prompt_ids']}")
+    print(f"full_ids={payload['full_ids']}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", required=True, type=Path, help="Output model directory")
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--max-new", type=int, default=8)
+    parser.add_argument("--prompt-ids", help="Comma-separated token IDs")
+    parser.add_argument("--no-ref", action="store_true", help="Do not emit ref.json")
+    parser.add_argument("--fp8-experts", action="store_true",
+                        help="routed experts as F8_E4M3 with 128x128 block weight_scale_inv "
+                             "sidecars (the release layout); the reference uses the same "
+                             "quantized values")
+    parser.add_argument("--expert-gain", type=float, default=1.0,
+                        help="scale the routed experts so they visibly move the logits "
+                             "(the int4 fixture uses 3)")
+    parser.add_argument("--int4-experts", action="store_true",
+                        help="also convert the routed experts to the experts-int4g64/ sidecar "
+                             "and write ref_int4.json, the reference of the dequantized sidecar")
+    parser.add_argument("--ple-layer", type=int, default=1,
+                        help="the PLE layer, one-based as in the config (default 1: layer 0)")
+    parser.add_argument("--mtp", action="store_true",
+                        help="add an MTP head (mtp.*, random weights from their own seed) with the "
+                             "release's tensor names; the model and ref.json do not change")
+    args = parser.parse_args()
+    prompt = [int(x) for x in args.prompt_ids.split(",") if x.strip()] if args.prompt_ids else None
+    build(args.out, prompt_ids=prompt, max_new=args.max_new, seed=args.seed, emit_ref=not args.no_ref,
+          fp8_experts=args.fp8_experts, int4_experts=args.int4_experts,
+          expert_gain=args.expert_gain, mtp=args.mtp, ple_layer=args.ple_layer)
+
+
+if __name__ == "__main__":
+    main()

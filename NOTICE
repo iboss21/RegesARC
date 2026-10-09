@@ -1,0 +1,28 @@
+RegesARC
+Copyright (C) 2026 Davidio Dev / iBoss21
+
+RegesARC is one launcher for Mixture-of-Experts models that do not fit in a
+consumer GPU. It is not a fork-of-a-fork and it does not vendor upstream git
+history. Mechanisms below were absorbed from pinned upstreams. Copyright
+notices stay.
+
+Strata
+  Copyright (C) Niko1221 and contributors
+  https://github.com/Niko1221/Strata
+  License: MIT
+  Absorbed: consumer-GPU placement (dense trunk and hot experts on the card,
+  cold experts streamed) and the OpenAI / Anthropic localhost server shape.
+  Not absorbed: START-HERE.bat, their model pack, their repo layout.
+
+Colibri
+  Copyright (C) Vincenzo Fornaro (JustVugg) and contributors
+  https://github.com/JustVugg/colibri
+  License: Apache-2.0
+  Absorbed: one-engine-file-per-MoE-family, safetensors range reads, expert
+  cache, disk streaming when the card cannot hold the hot set.
+  Not absorbed: the coli launcher, their web dashboard, their repo layout.
+
+Apache-2.0 patent grant and MIT notice requirements survive this rebrand.
+If an engine file lands in engines/, the commit that added it records the
+upstream tag it was taken from. If this file disagrees with the code, the
+code is right and this file is a bug.

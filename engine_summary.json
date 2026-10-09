@@ -1,0 +1,30 @@
+{
+  "files_created": [
+    {
+      "path": "c/include/engine.h",
+      "description": "Internal engine header with GGUF parsing, expert residency cache structures, and model lifecycle API"
+    },
+    {
+      "path": "c/src/engine.c",
+      "description": "Engine implementation: GGUF weight loading, per-layer LRU eviction caches, disk streaming for cold experts, speculative decoding support"
+    }
+  ],
+  "capabilities_implemented": [
+    "GGUF header parsing and tensor metadata extraction",
+    "Expert residency cache with per-layer LRU eviction",
+    "Disk streaming for cold expert access",
+    "Speculative decoding (MTP draft + verify) initialization",
+    "Thread-safe model lifecycle with mutex protection"
+  ],
+  "integration_points": {
+    "Python control plane": "reges/scan.py, reges/catalog.py, reges/place.py, reges/install.py, reges/serve.py",
+    "C API surface": "c/include/reges_api.h (public ABI)",
+    "Internal engine API": "c/include/engine.h (opaque model handle)"
+  },
+  "next_steps": [
+    "Compile with: gcc -shared -fPIC c/src/engine.c -o reges_engine.dll",
+    "Wire up Python ctypes bindings to load_model, generate, expert_pin/stream/evict",
+    "Add CUDA/GPU backend for VRAM placement (currently RAM-only)",
+    "Implement actual inference kernels (attention, MoE routing, token generation)"
+  ]
+}

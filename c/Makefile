@@ -1,0 +1,3037 @@
+# --- Target detection ---
+# Ask the compiler what it actually targets (rofl0r's note on #129): a gcc/clang
+# toolchain reports its target triple via `-dumpmachine`, e.g.
+#   x86_64-w64-mingw32   x86_64-pc-cygwin   x86_64-unknown-linux-gnu
+#   arm64-apple-darwin   powerpc64le-unknown-linux-gnu
+# The triple follows the toolchain, not the host shell that `uname` reports, so
+# it is correct under a native-Windows shell (no `uname` on PATH) AND when
+# cross-compiling (e.g. make CC=x86_64-w64-mingw32-gcc on Linux). CC is chosen
+# per-target below, so probe with the user's CC if they set one, else gcc
+# (present on Linux and mingw, and a clang shim on macOS).
+DETECT_CC := $(if $(filter default,$(origin CC)),gcc,$(CC))
+TRIPLET   := $(shell $(DETECT_CC) -dumpmachine 2>/dev/null)
+
+MINGW  := $(findstring mingw,$(TRIPLET))
+CYGWIN := $(findstring cygwin,$(TRIPLET))
+DARWIN := $(findstring darwin,$(TRIPLET))
+LINUX  := $(findstring linux,$(TRIPLET))
+IS_WIN := $(MINGW)$(CYGWIN)
+
+# Appended to every platform's flags, so a caller can add to the build without
+# replacing it. Overriding CFLAGS= on the command line would drop that
+# platform's OpenMP and -march flags, which is how a sanitizer run ends up
+# silently unsanitized. Used by test-asan; also the supported way to pass
+# your own flag: make colibri EXTRA_CFLAGS=-DFOO
+EXTRA_CFLAGS  ?=
+EXTRA_LDFLAGS ?=
+
+# Fallbacks for the rare toolchain that does not answer -dumpmachine: keep the
+# #129 signal (OS=Windows_NT, set in every Windows shell) for Windows, then
+# `uname` for everything else, so no host regresses.
+ifeq ($(TRIPLET),)
+IS_WIN := $(if $(filter Windows_NT,$(OS)),1,)
+ifeq ($(IS_WIN),)
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+DARWIN  := $(findstring Darwin,$(UNAME_S))
+endif
+endif
+
+TARGET_CPU := $(firstword $(subst -, ,$(TRIPLET)))
+ifeq ($(TARGET_CPU),)
+TARGET_CPU := $(UNAME_M)
+endif
+X86_64  := $(filter x86_64 amd64,$(TARGET_CPU))
+AARCH64 := $(filter aarch64 arm64,$(TARGET_CPU))
+PPC64   := $(filter powerpc64% ppc64%,$(TARGET_CPU))
+
+ifneq (,$(DARWIN))
+# --- macOS / Apple Silicon ---
+# Apple clang non include il runtime OpenMP: se c'e' libomp di Homebrew lo usa
+# (brew install libomp), altrimenti compila single-thread (i pragma omp sono ignorati).
+# Niente -march: su arm64 NEON e' baseline (i kernel __ARM_NEON si attivano da soli).
+CC      = clang
+# An OMPDIR from the command line survives the assignments below; one from the
+# environment would be overwritten by them. Both are the user's choice: record
+# that first, and probe nothing for it.
+OMP_EXPLICIT := $(filter command line environment,$(origin OMPDIR))
+ifeq ($(OMP_EXPLICIT),)
+OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
+# CLT-only Macs routinely have Homebrew installed but off the non-interactive
+# PATH (`make` from scripts, SSH, CI), which turned this probe into a silent
+# single-threaded build with libomp sitting right there on disk. Fall back to
+# the two standard Homebrew prefixes before concluding it is absent.
+ifeq ($(OMPDIR),)
+OMPDIR := $(firstword $(wildcard /opt/homebrew/opt/libomp /usr/local/opt/libomp))
+endif
+endif
+# `brew --prefix libomp` can print the formula's prospective path even when it
+# is not installed, so verify both artifacts before adding unusable flags.
+ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
+OMPINC := $(OMPDIR)/include
+OMPLIB := $(OMPDIR)/lib
+# MacPorts (`port install libomp`) nests both artifacts one level deeper than
+# Homebrew -- include/libomp/omp.h and lib/libomp/libomp.dylib -- so no single
+# prefix can pass the check above: probe its two directories directly. Not
+# when OMPDIR was the user's choice: one that holds no libomp means
+# single-threaded (tests/test_makefile_platform.py pins that).
+else ifeq ($(OMP_EXPLICIT),)
+ifneq ($(and $(wildcard /opt/local/include/libomp/omp.h),$(wildcard /opt/local/lib/libomp/libomp.*)),)
+OMPINC := /opt/local/include/libomp
+OMPLIB := /opt/local/lib/libomp
+endif
+endif
+ifneq ($(OMPINC),)
+OMPC    = -Xclang -fopenmp -I$(OMPINC)
+OMPL    = -L$(OMPLIB) -lomp
+else
+$(warning libomp not found: building single-threaded. For multithreading: brew install libomp (or port install libomp))
+OMPC    =
+OMPL    =
+endif
+CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+# Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
+# which unlocks the i8mm SMMLA int8/int4 dot kernels in colibri.c. ARCH unset ->
+# no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
+# For older X86_64 Macs (for example, Mac Pro 2019) we need to use -march
+ifneq ($(ARCH),)
+ifneq (,$(X86_64))
+CFLAGS += -march=$(ARCH)
+else
+CFLAGS += -mcpu=$(ARCH)
+endif
+endif
+LDFLAGS = -lm $(OMPL) $(EXTRA_LDFLAGS)
+# LTO is opt-in (LTO=1), not default: cross-TU inlining can change
+# floating-point contraction (FMA formation), and colibri's token-exactness
+# oracles are validated against the default build's optimization regime
+# (#1044/#1024 showed how FMA + accumulator order changes rounding).
+# Enable only after a token-exactness A/B on your own toolchain.
+ifeq ($(LTO),1)
+CFLAGS  += -flto
+LDFLAGS += -flto
+endif
+EXE     =
+else ifneq ($(IS_WIN),)
+# --- Windows 11 x86-64 (MinGW-w64 / MSYS2) ---
+# GCC + libgomp + winpthreads: pthread, OpenMP, clock_gettime, opendir/readdir,
+# AVX2 intrinsics - tutto gratis, nessun porting.
+# ARCH default = x86-64-v3 (portable binary with AVX2). For max speed on THIS
+# machine use ARCH=native: on AVX-VNNI CPUs (Intel Alder Lake+, Meteor Lake+)
+# it also unlocks the 128-bit VPDPBUSD int8/int4 dot kernel (dot_i8i8/dot_i4i8),
+# which the x86-64-v3 baseline does not define. The #ifdef guards in colibri.c mean
+# a v3 build simply compiles out the VNNI path - safe on any x86-64.
+CC      = gcc
+ARCH   ?= x86-64-v3
+CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+# -lpsapi: compat.h calls GetProcessMemoryInfo (rss_gb). It's linked via
+# #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
+# (warns), so link psapi explicitly or the build fails undefined-reference on
+# modern GCC (e.g. 16.x under UCRT). Harmless where the pragma also resolves it.
+LDFLAGS = -lm -fopenmp -static -lpsapi $(EXTRA_LDFLAGS)
+ifeq ($(LTO),1)
+CFLAGS  += -flto
+LDFLAGS += -flto
+endif
+EXE     = .exe
+else
+ifneq (,$(PPC64))
+# --- Linux PowerPC (POWER8/POWER9/POWER10) ---
+# PowerPC GCC uses -mcpu, not -march. ARCH=native works on gcc >= 4.7.
+# The AVX2/NEON kernels fall back to the portable scalar C path
+# (validated token-exact vs the transformers oracle on a POWER8 S824).
+CC      = gcc
+ARCH   ?= native
+CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
+ifeq ($(LTO),1)
+CFLAGS  += -flto
+LDFLAGS += -flto
+endif
+EXE     =
+else ifneq (,$(AARCH64))
+# --- Linux / *BSD aarch64 (#631) ---
+# NEON e' baseline, ma i kernel SDOT/SMMLA int8-int4 vivono dietro
+# __ARM_FEATURE_DOTPROD / __ARM_FEATURE_MATMUL_INT8. A gcc that does not know
+# this core (gcc 13 vs Cortex-X925 on GB10: #631) degrades native to plain
+# armv8-a SILENTLY: the kernels compile out, no warning, the banner says
+# "idot: neon" and int4 S=1 decode falls back to f32. So for the default
+# ARCH=native, probe the macro; if it is missing, re-add the features the
+# silicon itself reports in /proc/cpuinfo -- but keep them only if this
+# compiler accepts the modifiers (gcc < 10 has no +i8mm: composing blindly
+# would turn a slow build into a broken one).
+CC      = gcc
+ARCH   ?= native
+ifeq ($(ARCH),native)
+ARCHFLAG := -mcpu=native
+ifeq ($(shell $(CC) -mcpu=native -dM -E - </dev/null 2>/dev/null | grep -c __ARM_FEATURE_MATMUL_INT8),0)
+CPUFEAT  := $(shell grep -m1 '^Features' /proc/cpuinfo 2>/dev/null)
+ARCH_EXT := $(if $(filter asimddp,$(CPUFEAT)),+dotprod)$(if $(filter i8mm,$(CPUFEAT)),+i8mm)
+ifneq ($(ARCH_EXT),)
+# gcc 11 defines __ARM_FEATURE_DOTPROD for -march=armv8-a+dotprod yet cannot
+# emit vdotq_s32 for that base ("target specific option mismatch"): the macro
+# probe alone is not enough. Verify by compiling the intrinsic for real, and
+# prefer the armv8.2-a base where dotprod is a first-class ISA feature
+# (Neoverse-N1 and friends report asimddp but are armv8.2 cores). Fall back to
+# armv8-a only if the compiler accepts the modifiers there too; otherwise the
+# idot kernels compile out and int4 S=1 decode falls back to f32 (#631, #1104).
+PROBE_C := $(shell mktemp /tmp/coli_v4_probe.XXXXXX.c)
+PROBE_OK := $(shell echo '#include <arm_neon.h>' > $(PROBE_C); echo 'int p(const signed char*w,const signed char*x,int n){int32x4_t a=vdupq_n_s32(0);for(;n>=16;n-=16)a=vdotq_s32(a,vld1q_s8(w),vld1q_s8(x));return vaddvq_s32(a);}' >> $(PROBE_C); $(CC) -c $(PROBE_C) -o /dev/null -march=armv8.2-a$(ARCH_EXT) 2>/dev/null && echo yes; rm -f $(PROBE_C))
+ifeq ($(PROBE_OK),yes)
+ARCHFLAG := -march=armv8.2-a$(ARCH_EXT)
+else
+PROBE_C8 := $(shell mktemp /tmp/coli_v4_probe.XXXXXX.c)
+PROBE_OK8 := $(shell echo '#include <arm_neon.h>' > $(PROBE_C8); echo 'int p(const signed char*w,const signed char*x,int n){int32x4_t a=vdupq_n_s32(0);for(;n>=16;n-=16)a=vdotq_s32(a,vld1q_s8(w),vld1q_s8(x));return vaddvq_s32(a);}' >> $(PROBE_C8); $(CC) -c $(PROBE_C8) -o /dev/null -march=armv8-a$(ARCH_EXT) 2>/dev/null && echo yes; rm -f $(PROBE_C8))
+ifeq ($(PROBE_OK8),yes)
+ARCHFLAG := -march=armv8-a$(ARCH_EXT)
+else
+$(warning $(CC) does not accept$(subst +, +,$(ARCH_EXT)): int8/int4 idot kernels compile out (#631))
+endif
+endif
+endif
+endif
+else ifneq (,$(filter armv%,$(ARCH)))
+ARCHFLAG := -march=$(ARCH)
+else
+ARCHFLAG := -mcpu=$(ARCH)
+endif
+CFLAGS  = -O3 $(ARCHFLAG) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
+ifeq ($(LTO),1)
+CFLAGS  += -flto
+LDFLAGS += -flto
+endif
+EXE     =
+else
+# --- Linux / *BSD x86-64 (percorso originale, invariato) ---
+CC      = gcc
+# ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce).
+# ARCH=x86-64-v3 -> binario PORTABILE su qualsiasi x86-64 moderno con AVX2 (per distribuire).
+# ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
+# -pthread: Linux lo tira dentro via -fopenmp, i *BSD no e le pthread_* non risolvono (#219).
+ARCH   ?= native
+CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
+ifeq ($(LTO),1)
+CFLAGS  += -flto
+LDFLAGS += -flto
+endif
+EXE     =
+endif
+endif
+
+# Header prerequisites are generated by the compiler, not listed by hand
+# (#1741). -MMD writes <output>.d beside every binary or object compiled with
+# CFLAGS, naming each project header that compile actually read; -MP adds an
+# empty rule per header, so deleting one does not break the next build. The
+# .d files are read at the end of this Makefile, next to the list of rules they
+# cover (AUTODEP_BINS).
+CFLAGS += -MMD -MP
+
+# --- install ---
+PREFIX     ?= /usr/local
+BINDIR     ?= $(PREFIX)/bin
+LIBEXECDIR ?= $(PREFIX)/libexec/colibri
+INSTALL    ?= install
+
+# CUDA=1 adds an opt-in backend for resident tensors. The default build remains
+# pure C and keeps the original zero-dependency runtime.
+#
+# Two paths:
+#   - Linux/macOS: CUDA=1 links backend_cuda.o directly (cudart via -l).
+#   - Windows:      CUDA_DLL=1 builds a standalone coli_cuda.dll (nvcc+MSVC),
+#                   then the host glm.exe loads it at runtime via backend_loader.c
+#                   (LoadLibrary/GetProcAddress). MinGW gcc cannot compile .cu
+#                   (nvcc needs cl.exe), and cross-linking MSVC objects into a
+#                   gcc binary is fragile — the DLL split keeps the toolchains
+#                   clean. See backend_loader.c and README "cuda-dll" below.
+CUDA      ?= 0
+CUDA_DLL  ?= 0
+COLI_ANS  ?= 0
+DIETGPU_ROOT ?=
+DEEPGEMM  ?= 0
+NCCL      ?= 0
+# DeepGEMM sm120 headers for the DeepSeek V4 DeepGEMM flavour: a pinned
+# checkout made by tools/fetch_deepgemm.sh on first use (gitignored), see the
+# DeepSeek V4 CUDA kernels block and the cuda-dsv4-dg-dll target below.
+DEEPGEMM_HOME ?= third_party/deepgemm
+DEEPGEMM_PIN ?= 39fb4447a062b418fd08ce17cd308adb28559417
+DEEPGEMM_STAMP = $(DEEPGEMM_HOME)/deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh
+ifneq ($(IS_WIN),)
+# the CUDA installer sets CUDA_PATH system-wide (e.g. C:\Program Files\NVIDIA
+# GPU Computing Toolkit\CUDA\v13.2); fall back to it before the POSIX default.
+# NVCC defaults to plain `nvcc` from PATH: CUDA_PATH contains spaces, which the
+# unquoted recipe checks cannot survive — and the cuda-dll recipe already
+# requires an MSVC environment (vcvars64) on PATH, so requiring the CUDA bin
+# directory too is symmetric. The installer adds it by default.
+CUDA_HOME ?= $(subst \,/,$(CUDA_PATH))
+NVCC      ?= nvcc
+# Host compiler override for nvcc (e.g. Fedora ships g++16 but CUDA needs 15):
+#   make glm CUDA=1 NVCC_CCBIN=g++-15        (opt-in: unset = nvcc's own default)
+ifneq ($(NVCC_CCBIN),)
+NVCCFLAGS += -ccbin $(NVCC_CCBIN)
+endif
+else
+CUDA_HOME ?= /usr/local/cuda
+NVCC      ?= $(CUDA_HOME)/bin/nvcc
+endif
+# CUDA target selection. Default `native` builds SASS for the build machine's GPU
+# only (fast local dev). A headless CI/Docker build has no GPU, so `-arch=native`
+# there detects nothing and the shipped coli_cuda.dll fails at first kernel dispatch.
+# For a portable/release DLL that runs on any Ampere..Blackwell card AND JITs on
+# newer archs, build with CUDA_ARCH=portable: it emits SASS for sm_80/86/89/90/120
+# plus a compute_120 PTX fallback (sm_120 / RTX 50-series needs CUDA >= 12.8).
+# sm_121 (GB10 Spark) needs CUDA >= 12.9, so its gencode joins only when the
+# detected toolkit supports it — the portable floor stays 12.8. The version
+# probe fails closed: no or unparsable nvcc means no compute_121 (the
+# compute_120 PTX still JITs on sm_121).
+CUDA_ARCH ?= native
+ifeq ($(CUDA_ARCH),portable)
+CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
+               -gencode arch=compute_86,code=sm_86 \
+               -gencode arch=compute_89,code=sm_89 \
+               -gencode arch=compute_90,code=sm_90 \
+               -gencode arch=compute_120,code=sm_120 \
+               -gencode arch=compute_120,code=compute_120
+NVCC_RELEASE := $(shell "$(NVCC)" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+# The empty-check makes the fail-closed promise real: with no parsable
+# version the sort below would compare 12.9 against itself and pass.
+ifneq ($(strip $(NVCC_RELEASE)),)
+ifeq ($(shell printf '%s\n' 12.9 $(NVCC_RELEASE) | sort -V 2>/dev/null | head -1),12.9)
+CUDA_GENCODE += -gencode arch=compute_121,code=sm_121
+endif
+endif
+else
+CUDA_GENCODE = -arch=$(CUDA_ARCH)
+endif
+# NVCC_STD is a variable so an optional backend can raise the standard without
+# rewriting the whole flag line: DEEPGEMM=1 needs C++20, and replacing
+# NVCCFLAGS wholesale to get it would also discard $(CUDA_GENCODE) and any
+# -ccbin the user set above.
+NVCC_STD ?= c++17
+ifneq ($(IS_WIN),)
+# nvcc's host compiler on Windows is MSVC cl.exe: the GCC-style
+# -Xcompiler=-Wall,-Wextra is rejected ("D8021 invalid numeric argument
+# '/Wextra'"), which made `make cuda-dll` unbuildable as shipped. -W3 is
+# the MSVC warning level (dash form, NOT /W3: MSYS make would mangle the
+# slash-form into a filesystem path).
+NVCCFLAGS ?= -O3 -std=$(NVCC_STD) -ftz=false $(CUDA_GENCODE) -Xcompiler=-W3
+else
+# -ftz=false is nvcc's default, pinned explicitly: the fmt=8 kernels are
+# cross-tier parity instruments and a flushed scale*subnormal contribution
+# silently diverges from the CPU reference (backend_cuda.cu also #errors on
+# fast-math builds, but -ftz alone defines no macro to guard on).
+NVCCFLAGS ?= -O3 -std=$(NVCC_STD) -ftz=false $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
+# glibc >= 2.41 declares the C23 math additions (rsqrt/rsqrtf, sinpi/cospi, ...)
+# with __THROW -> noexcept(true), clashing with CUDA's crt/math_functions.h
+# under C++17 (noexcept is part of the function type since C++17). Force-include
+# a compat header that strips __THROW from the host pass; see
+# glibc_c23_math_compat.h. MSVC never sees glibc headers, so Linux-only.
+ifneq ($(LINUX),)
+NVCCFLAGS += -Xcompiler=-include,$(CURDIR)/glibc_c23_math_compat.h
+endif
+endif
+# CUDA 13.1 host_config.h accepts only Visual Studio 2019-2022 and refuses
+# anything newer outright, so on a box with VS Build Tools 18 (MSVC 19.50)
+# EVERY nvcc target fails at the first #include with C1189 -- cuda-test,
+# cuda-dll, all of it. nvcc offers -allow-unsupported-compiler to override the
+# check, but there was no way to get one flag in: NVCCFLAGS is the only handle
+# and replacing it wholesale discards $(CUDA_GENCODE), the -ccbin set above and
+# the -Xcompiler warning form that Windows specifically needs -- the same
+# argument that made NVCC_STD a variable rather than a rewrite.
+#
+# Defaults to 0: nvcc's own wording is "may cause compilation failure or
+# incorrect run time execution", so an unsupported host compiler is the
+# builder's decision to make explicitly, not a default this Makefile makes for
+# them. Any result produced with it set should say so.
+NVCC_ALLOW_UNSUPPORTED ?= 0
+ifeq ($(NVCC_ALLOW_UNSUPPORTED),1)
+NVCCFLAGS += -allow-unsupported-compiler
+endif
+# HIP=1 builds the SAME backend for AMD GPUs via ROCm: backend_cuda.cu is
+# compiled unchanged through backend_gpu_compat.h (one source, two vendors,
+# like compat.h does for Windows). HIP_ARCH=native targets the GPU in this
+# machine; set an explicit arch (e.g. HIP_ARCH=gfx1201) when distributing.
+HIP       ?= 0
+# HIP_DLL=1 is the AMD sibling of CUDA_DLL=1 (Windows only): MinGW gcc cannot
+# compile .cu and hipcc on Windows targets the MSVC ABI, so the backend goes
+# into a standalone coli_hip.dll and the host loads it at runtime — exactly the
+# split the CUDA path already uses. The host never links amdhip64. Same single
+# source and same coli_cuda_* ABI the Linux HIP path reuses, so the host keeps
+# -DCOLI_CUDA; -DCOLI_HIP_DLL only records WHICH DLL it will look for.
+HIP_DLL   ?= 0
+ifneq ($(IS_WIN),)
+# One runtime DLL per host binary: the loader resolves a single hardcoded DLL
+# name, so a host built for both would silently be a host built for whichever
+# arm ran last. Checked FIRST, before the arch and flag guards below, so the
+# contradiction is reported instead of whichever downstream check trips.
+ifeq ($(CUDA_DLL)$(HIP_DLL),11)
+$(error choose CUDA_DLL=1 or HIP_DLL=1, not both)
+endif
+endif
+ROCM_HOME ?= /opt/rocm
+ifneq ($(IS_WIN),)
+# --- Windows HIP SDK contract (HIP_DLL only; the Linux ROCM_HOME contract
+# above is untouched) ---
+# NOTHING here may hardcode an install location: HIP_PATH is the variable the
+# official Windows HIP SDK installer sets, and a source-built or relocated SDK
+# is selected with HIP_SDK_ROOT=<path> (e.g. from `rocm-sdk path --root`).
+# Backslashes become forward slashes so the value survives the shell.
+#
+# Every component is separately overridable because packaged ROCm layouts do
+# not all keep runtime, development and device files under one root:
+#   HIP_SDK_ROOT         SDK root                  (--hip-path)
+#   HIP_INCLUDE_DIR      headers                   (-I)
+#   HIP_LIB_DIR          amdhip64.lib import lib   (-L)
+#   HIP_DEVICE_LIB_PATH  amdgcn device bitcode     (--rocm-device-lib-path)
+HIP_SDK_ROOT        ?= $(subst \,/,$(HIP_PATH))
+HIP_BIN_DIR         ?= $(HIP_SDK_ROOT)/bin
+HIP_INCLUDE_DIR     ?= $(HIP_SDK_ROOT)/include
+HIP_LIB_DIR         ?= $(HIP_SDK_ROOT)/lib
+HIP_DEVICE_LIB_PATH ?= $(HIP_SDK_ROOT)/lib/llvm/amdgcn/bitcode
+HIPCC               ?= $(HIP_BIN_DIR)/hipcc.exe
+else
+HIPCC     ?= $(ROCM_HOME)/bin/hipcc
+endif
+HIP_ARCH  ?= native
+# HIP_ARCH accepts a list (space- or comma-separated, e.g. "gfx906 gfx1030")
+# to fat-bundle several targets into one binary; COLI_GPUS picks at runtime.
+# `native` is resolved to the local GPUs' arch names HERE (not left to hipcc):
+# the NO_WMMA_ARCHS filter below must see real gfx names to know whether the
+# rocWMMA paths can compile at all. `override` beats command-line assignment.
+comma := ,
+override HIP_ARCH := $(subst $(comma), ,$(HIP_ARCH))
+ifeq ($(strip $(HIP_ARCH)),native)
+ifeq ($(HIP),1)
+override HIP_ARCH := $(shell $(ROCM_HOME)/bin/rocm_agent_enumerator 2>/dev/null | grep -v gfx000 | sort -u)
+ifeq ($(strip $(HIP_ARCH)),)
+$(error HIP_ARCH=native but rocm_agent_enumerator found no GPUs; set HIP_ARCH=gfxNNNN explicitly)
+endif
+endif
+endif
+# Guards for the Windows HIP path, active ONLY when the hip-dll TARGET is
+# requested — never for HIP_DLL=1 alone. HIP_DLL=1 selects the host arm, which
+# compiles backend_loader.c and links colibri.exe against no HIP library and no
+# SDK header: demanding an SDK there blocks a build that needs nothing from one
+# (and HIP_PATH is not visible in every shell, e.g. an MSYS2 login shell).
+# The default CPU build must never depend on a HIP path either.
+#
+# Only the string checks live here. Existence checks (hipcc, headers, import
+# library, device bitcode) run in the hip-dll recipe instead. The stock Windows
+# HIP SDK location may contain spaces, and $(wildcard) splits its argument on
+# them, so a parse-time $(wildcard) check can incorrectly report a valid
+# installation as missing. The recipe's shell tests are quoted and handle
+# spaces correctly.
+ifneq ($(IS_WIN),)
+HIP_DLL_TARGET_REQUESTED := $(filter hip-dll,$(MAKECMDGOALS))
+ifneq ($(HIP_DLL_TARGET_REQUESTED),)
+ifeq ($(strip $(HIP_SDK_ROOT)),)
+$(error Windows HIP build: no HIP SDK selected. Set HIP_PATH, or pass HIP_SDK_ROOT=<path> (e.g. from `rocm-sdk path --root`))
+endif
+# Windows has no rocm_agent_enumerator to resolve `native` against, and the
+# enumerator branch above is HIP=1-only, so an unset HIP_ARCH would reach hipcc
+# as --offload-arch=native and fail deep inside the compiler. Demand the arch
+# here, where the cause is still visible.
+ifeq ($(strip $(HIP_ARCH)),native)
+$(error Windows HIP build: set an explicit HIP_ARCH=gfxNNNN (rocm_agent_enumerator is not available here), e.g. HIP_ARCH=gfx1151)
+endif
+ifeq ($(strip $(HIP_ARCH)),)
+$(error Windows HIP build: HIP_ARCH is empty; set HIP_ARCH=gfxNNNN, e.g. HIP_ARCH=gfx1151)
+endif
+endif
+endif
+ifneq ($(IS_WIN),)
+# No -fPIE on Windows: it is there for the Linux PIE link of backend_cuda.o into
+# the gcc engine (the readelf guard in ci.yml exists because dropping it made
+# that link fail), and it is meaningless for a PE DLL MinGW never links against.
+# -Wall/-Wextra DO carry over unchanged — hipcc is clang and takes GCC-style
+# warning flags directly. nvcc's -Xcompiler=-W3 workaround above is specific to
+# nvcc driving cl.exe as its host compiler and must NOT be copied here.
+HIPCCFLAGS ?= -O3 -std=c++17 -x hip $(foreach a,$(HIP_ARCH),--offload-arch=$(a)) -Wall -Wextra
+else
+HIPCCFLAGS ?= -O3 -std=c++17 -x hip $(foreach a,$(HIP_ARCH),--offload-arch=$(a)) -Wall -Wextra -fPIE
+endif
+GPUCC      = $(NVCC)
+GPUFLAGS   = $(NVCCFLAGS)
+GPUCC_NAME = nvcc (set CUDA_HOME or NVCC)
+# PYTHON is a HOST tool (clean/test-c/test-python run it on the build machine),
+# so key it off the host, NOT $(IS_WIN) — which is derived from the *target*
+# triple ($(CC) -dumpmachine). Otherwise a cross build (make CC=x86_64-w64-
+# mingw32-gcc ... on Linux) sets IS_WIN and picks `python`, breaking clean/test
+# on hosts where only `python3` exists. $(OS)=Windows_NT in every Windows shell
+# (the #129 signal) and is empty on Linux/macOS.
+ifeq ($(OS),Windows_NT)
+PYTHON    ?= python
+else
+PYTHON    ?= python3
+endif
+CUDA_OBJ  =
+
+# DeepSeek V4 is a separate x86-64/aarch64 runtime. Portable infrastructure
+# tests run everywhere; the engine and token-exact fixture run on x86-64
+# Linux/Windows, aarch64 Linux, and arm64 macOS. SIMD fast paths are gated
+# per-feature inside the sources, so a plain armv8-a build stays correct.
+# macOS portability rides compat.h (posix_fadvise -> F_RDADVISE, O_DIRECT ->
+# F_NOCACHE via st.h's direct twins) plus a mach branch for available memory;
+# the token-exact tiny fixture is the acceptance gate on the macos runner.
+COLI_V4_SUPPORTED :=
+ifneq (,$(X86_64))
+ifneq (,$(IS_WIN)$(LINUX))
+COLI_V4_SUPPORTED := 1
+endif
+endif
+ifneq (,$(AARCH64))
+ifneq (,$(LINUX)$(DARWIN))
+COLI_V4_SUPPORTED := 1
+endif
+endif
+
+# Gates are exactly the tests that have a build rule further down -- derived from those
+# rules, so adding a gate means adding your tests/test_*.c and its rule, and nothing else.
+# There is no shared list to conflict on.
+#
+# This replaced a single hand-written TEST_BINS line. c/Makefile appears in most open PRs,
+# and any two that each added a test conflicted on that line by construction; #386 hit it
+# twice while being rebased. A first attempt (#731) globbed tests/test_*.c, which was wrong
+# in the other direction: it promoted files that deliberately have no rule (a branch's
+# work-in-progress test, test_fse, test_tok, test_tok_kimi, test_vk_mxfp4) into gates, and
+# they fail to link. Having a rule is the honest definition of "this is a gate".
+# RULE_NAMES is every `NAME$(EXE):` rule, with its directory; one pass over the
+# Makefile serves both TEST_RULES here and ENGINE_RULES (#1741, end of file).
+RULE_NAMES  := $(shell sed -n 's|^\([a-z0-9_/]*\)\$$(EXE):.*|\1|p' $(firstword $(MAKEFILE_LIST)))
+TEST_RULES  := $(patsubst tests/%,%,$(filter tests/test_%,$(RULE_NAMES)))
+# test_uring is Linux-only. V4 engine tests are appended below only on supported
+# x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
+# unconditional rules and therefore remain portable gates. The six forced
+# SSE4.1 tests use -msse4.1/-mno-avx2/-mno-fma, which only exist as gcc/clang
+# flags on x86 -- unconditionally in TEST_BINS they take down `check` on
+# arm64 (e.g. macOS): "unsupported option '-msse4.1' for target arm64-...".
+# Appended back below only on x86-64 hosts, alongside the other conditional
+# platform tests already handled the same way.
+# test_xdna_execution and test_xdna_failure are Windows-only for the same kind
+# of reason: they load tests/xdna_fake_helper.dll through the XDNA loader, which
+# is LoadLibraryExA. Off Windows the loader answers ABSENT by design, so there
+# is nothing for them to bind to, and the synthetic helper is a __declspec DLL
+# that gcc and clang refuse to compile. The other three XDNA owners (registry,
+# prepared state, QT state) touch no loader and stay portable gates.
+# test_e8x4g64_loader takes a minted container directory on argv and prints its
+# usage (exit 2) without one, so it is a harness rather than a gate: it has a
+# rule here so it compiles under the suite's own $(CFLAGS) and its warnings are
+# caught -- reachable via `make e8x4g64-loader-check`, kept out of `check` itself
+# since a bare invocation exits 2 -- and tests/test_e8x4g64_mint_load.py is what
+# actually drives it end to end.
+# test_qwen38_tier_engine drives qwen38.c over the generated FP8 fixture
+# (qwen38_tiny_fp8, gitignored); it runs from qwen38-tier-engine-check. test_qwen38_dn_gpu does the same from
+# qwen38-dn-gpu-check.
+TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
+	test_segment_adapters_registration test_segment_adapters_real \
+	test_edge_adapters_registration test_edge_adapters_real \
+	test_xdna_execution test_xdna_failure \
+	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu \
+	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
+	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
+TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
+TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
+ifneq (,$(LINUX))
+TEST_BINS += tests/test_uring$(EXE)
+TEST_BINS += tests/test_exact_dot$(EXE)
+endif
+ifneq (,$(IS_WIN))
+TEST_BINS += tests/test_xdna_execution$(EXE) tests/test_xdna_failure$(EXE)
+endif
+ifneq (,$(X86_64))
+TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
+	tests/test_olmoe_dot_i8_16_sse41$(EXE) tests/test_st_f16_bf16_simd_sse41$(EXE) \
+	tests/test_i4_grouped_sse41$(EXE) \
+	tests/test_i4_grouped_sse41_o1$(EXE) tests/test_i4_grouped_sse41_no_contract$(EXE)
+endif
+ifeq ($(COLI_V4_SUPPORTED),1)
+TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
+TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
+	tests/test_v4_serve_framing$(EXE) \
+	tests/test_segment_adapters_registration$(EXE) \
+	tests/test_edge_adapters_registration$(EXE)
+endif
+
+# Windows CUDA/HIP DLL path: host links the loader, NOT cudart or amdhip64.
+# (CUDA_DLL/HIP_DLL mutual exclusion is enforced at the HIP_DLL declaration.)
+ifneq ($(IS_WIN),)
+ifeq ($(CUDA_DLL),1)
+CFLAGS  += -DCOLI_CUDA
+CUDA_OBJ = backend_loader.o
+endif
+ifeq ($(HIP_DLL),1)
+# -DCOLI_CUDA keeps the existing shared GPU ABI (Linux HIP already reuses the
+# coli_cuda_* surface); -DCOLI_HIP_DLL is only the build discriminator, so a
+# later phase can point the loader at coli_hip.dll. No LDFLAGS change: linking
+# amdhip64 into the MinGW host is exactly what the DLL split exists to avoid.
+CFLAGS  += -DCOLI_CUDA -DCOLI_HIP_DLL
+CUDA_OBJ = backend_loader.o
+endif
+endif
+
+# Linux CUDA direct-link path (unchanged).
+ifeq ($(CUDA),1)
+ifneq (,$(DARWIN))
+$(error CUDA=1 is supported only on Linux)
+endif
+ifneq ($(IS_WIN),)
+# On Windows use CUDA_DLL=1 (runtime DLL), not CUDA=1 (direct link).
+$(error On Windows use: make CUDA_DLL=1 cuda-dll  (see backend_loader.c))
+endif
+ifeq ($(HIP),1)
+$(error choose CUDA=1 or HIP=1, not both)
+endif
+CFLAGS   += -DCOLI_CUDA
+LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lcublasLt -lcublas -lstdc++
+CUDA_OBJ  = backend_cuda.o
+INK_CUDA_OBJ = backend_cuda_ink.o
+ifeq ($(COLI_ANS),1)
+ifeq ($(strip $(DIETGPU_ROOT)),)
+$(error DIETGPU_ROOT is required when COLI_ANS=1)
+endif
+CFLAGS   += -DCOLI_ANS
+GPUFLAGS += -DCOLI_ANS -I$(DIETGPU_ROOT) -I$(DIETGPU_ROOT)/build/third_party/glog -I$(DIETGPU_ROOT)/third_party/glog/src
+ANS_LIBS  = -L$(DIETGPU_ROOT)/build/lib -Wl,-rpath,$(DIETGPU_ROOT)/build/lib -lgpu_ans -ldietgpu_utils -lglog
+ANS_NVCC_LIBS = -L$(DIETGPU_ROOT)/build/lib -Xlinker -rpath -Xlinker $(DIETGPU_ROOT)/build/lib -lgpu_ans -ldietgpu_utils -lglog
+LDFLAGS  += $(ANS_LIBS)
+endif
+
+# --- DeepSeek V4 CUDA kernels -------------------------------------------
+# The GPU tier for the DeepSeek V4 engine in Makefile.deepseek-v4. These
+# objects are self-contained: backend_cuda_dsv4.* include only their own header
+# and the CUDA runtime, so they build and their tests run without the engine.
+#
+# DEEPGEMM is an opt-in: its kernels require Blackwell (sm_120a) to run and CI
+# does not compile it. It gates nothing and blocks nothing; the default build
+# (generic kernels, any sm_80+) is the supported configuration and the one to
+# report bugs against. The sm120 headers it needs are NOT in this repository:
+# tools/fetch_deepgemm.sh checks out the community sm120 port at a pinned
+# commit into third_party/deepgemm (gitignored), verifies the pin, applies
+# patches-deepgemm-sm120-msvc.patch, and DEEPGEMM=1 / cuda-dsv4-dg-dll invoke
+# it on first build (deepgemm-fetch). DEEPGEMM_HOME points at an existing
+# checkout instead; DEEPGEMM_PIN bumps the commit. Attribution:
+# THIRD_PARTY_NOTICES.md.
+DSV4_CUDA_OBJ = backend_cuda_dsv4.o
+ifeq ($(DEEPGEMM),1)
+DSV4_DEEPGEMM_DEP = $(DEEPGEMM_STAMP)
+CFLAGS += -DCOLI_DSV4_DEEPGEMM
+# Append, never replace. This was `:=` and discarded the whole inherited flag
+# set: $(CUDA_GENCODE), so any CUDA_ARCH the user chose was silently swapped for
+# a hardcoded sm_120f -- making DEEPGEMM=1 a Blackwell-only path by accident
+# rather than by design -- and the -ccbin above, which is how a host whose
+# default g++ is too new for CUDA names a supported host compiler. DeepGEMM
+# needs C++20 and the relaxed-constexpr/extended-lambda pair, not its own arch.
+override NVCC_STD  := c++20
+override NVCCFLAGS += --expt-relaxed-constexpr --expt-extended-lambda -DCOLI_DSV4_DEEPGEMM -I"$(DEEPGEMM_HOME)" -I"$(DEEPGEMM_HOME)/deep_gemm/include" -I"$(DEEPGEMM_HOME)/cutlass/include" -I"$(DEEPGEMM_HOME)/third-party/cutlass/include"
+LDFLAGS += -lcuda
+endif
+ifeq ($(NCCL),1)
+CFLAGS += -DCOLI_DSV4_NCCL
+override NVCCFLAGS += -DCOLI_DSV4_NCCL
+LDFLAGS += -lnccl
+endif
+endif
+
+ifeq ($(HIP),1)
+ifeq (,$(LINUX))
+$(error HIP=1 is supported only on Linux)
+endif
+CFLAGS    += -DCOLI_CUDA
+LDFLAGS   += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
+CUDA_OBJ   = backend_cuda.o
+GPUCC      = $(HIPCC)
+GPUFLAGS   = $(HIPCCFLAGS)
+GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
+# The kernel test binaries link the HIP runtime explicitly: hipcc does not add
+# it for a plain link the way nvcc adds cudart (#1499: `make hip-test` failed
+# with undefined hipStreamSynchronize and the suite never ran on ROCm).
+GPU_TEST_LIBS = -L$(ROCM_HOME)/lib -lamdhip64
+# rocWMMA needs matrix cores (MFMA gfx908+ / WMMA gfx11xx); on these archs its
+# headers static_assert (ROCm/TheRock#1944). Compile the WMMA paths out and
+# let backend_gpu_compat.h fall back via COLI_GPU_HAS_WMMA=0. The flag must
+# reach both hipcc passes, hence a compile define, not an arch macro. If a
+# HIP_ARCH=native build dies inside rocwmma, set the arch explicitly.
+NO_WMMA_ARCHS = gfx803 gfx900 gfx902 gfx904 gfx906 gfx90c \
+                gfx1010 gfx1011 gfx1012 gfx1013 \
+                gfx1030 gfx1031 gfx1032 gfx1033 gfx1034 gfx1035 gfx1036 gfx1103
+ifneq (,$(filter $(HIP_ARCH),$(NO_WMMA_ARCHS)))
+HIPCCFLAGS += -DCOLI_HIP_NO_WMMA
+# The define must hold for every arch in the fat binary (host dispatch is
+# shared), so one incapable arch disables the WMMA kernels for all of them.
+# Loud, because on a WMMA-capable card that is a real capability loss.
+ifneq (,$(filter-out $(NO_WMMA_ARCHS),$(HIP_ARCH)))
+$(warning mixed HIP_ARCH list: $(filter $(HIP_ARCH),$(NO_WMMA_ARCHS)) cannot run rocWMMA -> tensor-core kernels disabled for ALL targets ($(HIP_ARCH)). Build separate binaries to keep WMMA on the capable card.)
+endif
+endif
+endif
+
+# METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
+# runtime, so no Xcode / offline metal compiler is required. Default build unchanged.
+METAL     ?= 0
+METAL_OBJ  =
+METALXX    = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
+ifeq ($(METAL),1)
+ifeq (,$(DARWIN))
+$(error METAL=1 is supported only on macOS)
+endif
+CFLAGS   += -DCOLI_METAL
+LDFLAGS  += -framework Metal -framework Foundation -lc++
+METAL_OBJ = backend_metal.o
+endif
+
+# VK=1 adds an opt-in Vulkan compute backend (any Vulkan 1.2 driver, e.g. Mesa/RADV)
+# for resident expert tensors. Independent of CUDA/HIP: works on GPUs ROCm doesn't
+# support (Polaris/RX 580); the VRAM-resident int4 expert-group PRIMITIVE measured ~35%
+# faster than the ROCm/HIP one on an RX 9070 (per-call incl. readback — end-to-end tok/s
+# depends on what else bounds the box; see docs/vulkan.md, benchmarking notes included).
+# Needs the Vulkan headers + glslc (shaderc) to build. Default build unchanged (all
+# colibri.c hooks under #ifdef COLI_VULKAN). The .comp shaders compile to .spv, loaded at
+# runtime from COLI_VK_SHADERS (default: alongside the binary / ./shaders).
+VK        ?= 0
+VK_OBJ     =
+VK_SPV     =
+GLSLC     ?= glslc
+ifeq ($(VK),1)
+CFLAGS   += -DCOLI_VULKAN
+# Nothing links the Vulkan loader: backend_vulkan.c opens it at run time (vk_load.h),
+# so a VK=1 binary starts where there is no libvulkan.so.1 or vulkan-1.dll and runs on
+# the CPU there. The release archives are built this way. dlopen needs -ldl before
+# glibc 2.34; Windows' LoadLibrary is in kernel32.
+ifeq ($(IS_WIN),)
+LDFLAGS  += -ldl
+endif
+# vk_tier.o: the routed-expert tier the MoE engines share (vk_tier.h); an engine
+# that does not call it links nothing from it.
+VK_OBJ    = backend_vulkan.o vk_tier.o
+VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
+            shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv \
+            shaders/expert_act_v4.spv shaders/qmatmul_grp.spv shaders/qmatmul_grp_gate_up.spv shaders/expert_sum.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_grp_gemv_gate_up.spv
+# vk_chain.o: a layer's dense chain recorded into one submission (vk_chain.h), and
+# its shaders; an engine that does not call it links nothing from it.
+VK_OBJ   += vk_chain.o
+VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv shaders/chain_dnconv.spv \
+            shaders/chain_dnrec.spv shaders/chain_ew.spv shaders/chain_qsa.spv shaders/chain_ple.spv \
+            shaders/chain_gemv.spv
+# the MLA ops (vk_chain.h): attention core, RoPE and LayerNorm rows, per-head weight
+# blocks, the DSA indexer's selection
+VK_SPV   += shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv
+# Kimi Delta Attention and manifold-constrained hyper-connections (vk_chain.h)
+VK_SPV   += shaders/chain_kda.spv shaders/chain_mhc.spv
+# the int8 decode GEMV with per-matrix rows per workgroup (optional at run time)
+VK_SPV   += shaders/chain_gemv2.spv
+# DeepSeek V4.1 Flash and DeepSeek V4 attention (vk_chain.h: vkc_dsv4_*)
+VK_SPV   += shaders/chain_dsv4.spv
+# Kimi K3's attention residuals and SiTU-GLU (vk_chain.h)
+VK_SPV   += shaders/chain_ares.spv
+# inkling's chain ops (made on first use): the short convolution and the attention
+# with its relative-position bias
+VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
+# blocked attention for prompt chunks (made on first use; vk_chain.c, chain_attnb.comp)
+VK_SPV   += shaders/chain_attnb.spv
+# the int8/int4 prompt GEMM on the matrix units (optional at run time)
+VK_SPV   += shaders/chain_gemm.spv
+# the KV cache split between the device and the host past the device's budget
+# (vk_chain.h: vkc_kvs_*; vk_kvsplit.h)
+VK_SPV   += shaders/chain_kvs.spv
+# the decision engines' encoders (laya, gliner_decide): bidirectional attention over row
+# ranges with DeBERTa's relative terms, LayerNorm, GeGLU, RoPE (made on first use)
+VK_SPV   += shaders/chain_enc.spv
+# the attention core on the matrix units for prompt chunks (optional at run time)
+VK_SPV   += shaders/chain_attn_flash.spv
+# a diffusion step's attention, every query row over every key row (made on first use;
+# qwenimage_chain.h)
+VK_SPV   += shaders/chain_attn_full.spv shaders/chain_attn_coop.spv
+# Qwen-Image's VAE decoder: a band's 3x3 taps and the DupUp3D shortcut (made on first use)
+VK_SPV   += shaders/chain_vae.spv
+endif
+
+# Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
+# a switch, a define, an object. Deliberately NOT a second executable -- the
+# capability compiles into the ordinary host and stays off until the user passes
+# `coli --xdna`.
+#
+# No LDFLAGS entry, unlike VK: this side never links XRT. backend_xdna.c resolves
+# the optional helper (coli_xdna.dll) through LoadLibraryExA at runtime, so an
+# XDNA=1 host has the same import table as a default one and starts normally on a
+# machine with no NPU, no XRT and no helper. See docs/xdna.md.
+XDNA      ?= 0
+XDNA_OBJ   =
+ifeq ($(XDNA),1)
+CFLAGS   += -DCOLI_XDNA
+XDNA_OBJ  = backend_xdna.o
+endif
+
+all: colibri$(EXE)
+
+# Tiny Kimi K3 fixture + vendor oracle.  The generator is numpy-only and
+# deterministic; ref.json is committed and comes from Moonshot's own modeling
+# code (tools/make_kimi_k3_ref.py, maintainer-run, SHA-256-pinned), so CI
+# needs neither torch nor network.  kimi_k3 builds on every platform, so
+# unlike the V4 targets this needs no support gate.
+.PHONY: kimi-k3-tiny-generate kimi-k3-tiny-check
+kimi-k3-tiny-generate:
+	$(PYTHON) tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+
+kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
+	$(PYTHON) tests/test_kimi_k3_tiny.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k3_tiny
+	$(PYTHON) tests/test_kimi_k3_ckpt.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k3_tiny
+	$(PYTHON) tests/test_kimi_k3_dashboard.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k3_tiny
+
+.PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
+	deepseek-v4-tiny-check deepseek-v4-clean
+ifeq ($(COLI_V4_SUPPORTED),1)
+deepseek-v4:
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
+
+deepseek-v4-clean:
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+
+deepseek-v4-tiny-generate:
+	$(PYTHON) tools/make_deepseek_v4_tiny.py \
+		--output ./deepseek_v4_tiny --force
+
+deepseek-v4-tiny-check: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) deepseek-v4
+	$(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	$(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	$(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+
+deepseek-v4-oracle: deepseek-v4
+	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
+	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--output tests/deepseek_v4_oracle.json \
+		--memory-gb $(or $(MEMORY_GB),32) \
+		--prompt "$(or $(ORACLE_PROMPT),The capital of France is)" \
+		--validate \
+		--teacher-forcing $(or $(ORACLE_TEACHER_FORCING),32) \
+		--greedy $(or $(ORACLE_GREEDY),20)
+else
+deepseek-v4 deepseek-v4-oracle:
+	@echo "$@ is supported only on x86-64/aarch64 Linux and Windows/MSYS2" >&2; exit 1
+deepseek-v4-clean:
+	@:
+deepseek-v4-tiny-check:
+	@echo "SKIP deepseek-v4-tiny-check: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+deepseek-v4-tiny-generate:
+	@echo "SKIP deepseek-v4-tiny-generate: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+endif
+
+# Convenience aliases — 'glm' kept for backward compatibility.
+# On POSIX EXE is empty, so `colibri: colibri$(EXE)` becomes a self-dependency
+# and marking it phony also forces the real binary to rebuild on every invocation.
+# Only create the alias when the platform executable suffix makes it distinct.
+ifneq ($(EXE),)
+.PHONY: colibri
+colibri: colibri$(EXE)
+endif
+.PHONY: glm
+glm: colibri$(EXE)
+
+# Config stamp: make only tracks file timestamps, not flag changes. Without this,
+# `make colibri.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date"
+# and silently keeps the CPU-only binary (no CUDA loader) — a build that looks like
+# it worked but isn't. We record the build-affecting flags in .build-config and
+# rewrite it ONLY when they change (evaluated here at parse time, so the file's
+# timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
+# on it, so they relink on a config change and stay put otherwise. (#306)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
+BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
+ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
+# $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
+# spawning a shell. The earlier `$(shell printf '%s' ... > .build-config)`
+# required a POSIX `printf` on PATH — present under MSYS2/Git-Bash but NOT under
+# cmd.exe, so `make glm.exe` from the VS Native Tools prompt or with scoop MinGW
+# (neither ships sh.exe) failed with "'printf' is not recognized" and left the
+# stamp stale. $(file ...) works regardless of the shell make falls back to. (#478)
+#
+# GNU Make 3.81 -- /usr/bin/make on macOS -- has no $(file ...): it expands to
+# nothing, the stamp is never written, and every build relinks (#1732). Make
+# 3.x is found there and not under cmd.exe (MSYS2 and MinGW ship 4.x), and
+# macOS always has a POSIX printf, so that one case keeps the shell write.
+ifneq ($(filter 3.%,$(MAKE_VERSION)),)
+$(shell printf '%s\n' '$(subst ','\'',$(BUILD_CONFIG))' > .build-config)
+else
+$(file >.build-config,$(BUILD_CONFIG))
+endif
+endif
+.build-config: ;
+
+colibri$(EXE): colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_OBJ) .build-config
+	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(XDNA_OBJ) -o colibri$(EXE) $(LDFLAGS)
+
+# Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
+backend_vulkan.o: backend_vulkan.c .build-config
+	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+vk_tier.o: vk_tier.c .build-config
+	$(CC) $(CFLAGS) -c vk_tier.c -o $@
+# The expert batch's grouped GEMM (qmatmul_grp.comp): down, and gate+up+SwiGLU with
+# -DGATE_UP. Same glslc requirement and fallback as qmatmul_coop.spv; at run
+# time the batch keeps its per-expert route without them.
+shaders/qmatmul_grp.spv: shaders/qmatmul_grp.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/qmatmul_grp_gate_up.spv: shaders/qmatmul_grp.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+vk_chain.o: vk_chain.c .build-config
+	$(CC) $(CFLAGS) -c vk_chain.c -o $@
+shaders/%.spv: shaders/%.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+# chain_attn_flash.comp needs the same glslc as qmatmul_coop.comp below, with the same
+# fallback; without its .spv the chain keeps chain_attn.comp.
+shaders/chain_attn_flash.spv: shaders/chain_attn_flash.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+# The cooperative-matrix GEMM needs a glslc that knows GL_KHR_cooperative_matrix
+# (shaderc 2023.6+). An older one keeps the committed .spv instead of failing the build;
+# at run time the shader is optional anyway (the fp32 GEMM takes over without it).
+shaders/qmatmul_coop.spv: shaders/qmatmul_coop.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+# chain_gemm.comp needs the same glslc as qmatmul_coop.comp above, with the same
+# fallback; without its .spv the chain keeps its other GEMMs.
+shaders/chain_gemm.spv: shaders/chain_gemm.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+
+# Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
+backend_loader.o: backend_loader.c .build-config
+	$(CC) $(CFLAGS) -c backend_loader.c -o $@
+
+# Optional XDNA2 (Ryzen AI NPU) lane, host side only. This object resolves an
+# optional coli_xdna.dll at runtime and links nothing: it needs no XRT header,
+# no XRT import library and no NPU, exactly like backend_loader.o needs no CUDA
+# SDK.
+#
+# W2-N8: colibri$(EXE) NOW links it, but only under XDNA=1 (see the switch
+# beside VK above). The default build still does not, and stays byte-for-byte
+# what it was. `make xdna-obj` remains useful on its own so a break in the C
+# side is caught without building a whole host.
+.PHONY: xdna-obj
+xdna-obj: backend_xdna.o
+backend_xdna.o: backend_xdna.c .build-config
+	$(CC) $(CFLAGS) -c backend_xdna.c -o $@
+
+# Windows CUDA DLL: compile backend_cuda.cu with nvcc (+MSVC cl.exe as host
+# compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
+# shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
+# "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
+# __declspec(dllexport) so the 15 API symbols are exported.
+cuda-dll: backend_cuda.cu backend_cuda.h fp8_format.h
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
+	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
+		-L"$(CUDA_HOME)/lib/x64" -lcudart \
+		backend_cuda.cu -o coli_cuda.dll
+
+# Windows HIP DLL: the AMD sibling of cuda-dll above. hipcc compiles the SAME
+# backend_cuda.cu (through backend_gpu_compat.h) into coli_hip.dll, exporting
+# the same coli_cuda_* surface — which is why COLI_CUDA_BUILDING_DLL, and not a
+# new HIP-specific export macro, is the correct switch here. No cl.exe guard
+# like cuda-dll's: hipcc brings its own clang host pass, but it still needs the
+# MSVC linker and Windows SDK, so run this from a vcvars64 shell.
+#
+# --hip-path pins the SDK: a machine can carry BOTH a driver-installed HIP SDK
+# and a source-built one, and clang injects the driver install via -idirafter on
+# its own. Without --hip-path the headers came from one tree while -L/-lamdhip64
+# and the device bitcode came from the other — the mismatch that made
+# <rocwmma/rocwmma.hpp> unfindable even though the selected SDK ships it.
+# --hip-path alone resolves both hip/ and rocwmma/ from the selected root;
+# -I"$(HIP_INCLUDE_DIR)" is kept because it takes precedence (verified) and is
+# the override point for layouts that split headers off the SDK root.
+# --rocm-device-lib-path is kept for determinism: clang can otherwise find the
+# bitcode relative to its own resource dir, which is a guess, not a contract.
+# Every SDK-derived path is quoted so an install under "C:\Program Files\..."
+# survives. No path is hardcoded — see the HIP SDK contract above.
+#
+#   make hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk> HIP_ARCH=gfx1151
+hip-dll: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h
+	@test -x "$(HIPCC)" || command -v "$(HIPCC)" >/dev/null 2>&1 || { echo "hipcc not found at \"$(HIPCC)\": set HIP_SDK_ROOT=<path>, HIP_BIN_DIR=<path> or HIPCC=<path>" >&2; exit 1; }
+	@test -d "$(HIP_INCLUDE_DIR)" || { echo "HIP include dir not found: \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
+	@test -f "$(HIP_INCLUDE_DIR)/hip/hip_runtime.h" || { echo "hip/hip_runtime.h missing under \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
+	@case "$(HIPCCFLAGS)" in *COLI_HIP_NO_WMMA*) ;; *) test -f "$(HIP_INCLUDE_DIR)/rocwmma/rocwmma.hpp" || { echo "rocwmma/rocwmma.hpp missing under \"$(HIP_INCLUDE_DIR)\": install the rocWMMA component, or set HIP_INCLUDE_DIR=<path>" >&2; exit 1; } ;; esac
+	@test -d "$(HIP_LIB_DIR)" || { echo "HIP lib dir not found: \"$(HIP_LIB_DIR)\" — set HIP_LIB_DIR=<path>" >&2; exit 1; }
+	@test -f "$(HIP_LIB_DIR)/amdhip64.lib" || { echo "amdhip64.lib missing under \"$(HIP_LIB_DIR)\" — set HIP_LIB_DIR=<path>" >&2; exit 1; }
+	@test -d "$(HIP_DEVICE_LIB_PATH)" || { echo "device bitcode dir not found: \"$(HIP_DEVICE_LIB_PATH)\" — set HIP_DEVICE_LIB_PATH=<path>" >&2; exit 1; }
+	"$(HIPCC)" $(HIPCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
+		--hip-path="$(HIP_SDK_ROOT)" \
+		-I"$(HIP_INCLUDE_DIR)" \
+		--rocm-device-lib-path="$(HIP_DEVICE_LIB_PATH)" \
+		-L"$(HIP_LIB_DIR)" -lamdhip64 \
+		backend_cuda.cu -o coli_hip.dll
+
+backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
+
+backend_cuda.o: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h .build-config
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
+
+
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config $(DSV4_DEEPGEMM_DEP)
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+
+# The pinned DeepGEMM sm120 checkout (see the DEEPGEMM block above). The stamp
+# is a header that only exists in the sm120 port, so an empty or wrong tree
+# refetches; the script itself is a no-op when the tree is already at the pin.
+deepgemm-fetch $(DEEPGEMM_STAMP):
+	DEEPGEMM_HOME="$(DEEPGEMM_HOME)" tools/fetch_deepgemm.sh "$(DEEPGEMM_PIN)"
+.PHONY: deepgemm-fetch
+
+# Windows DeepSeek V4 CUDA DLLs: the sibling of cuda-dll for the DeepSeek V4
+# engine. deepseek-v4.exe is built with MinGW gcc and cannot link MSVC/nvcc
+# objects, so backend_cuda_dsv4.cu compiles into its own DLL (nvcc + MSVC
+# cl.exe as host) whose symbols are exported via dsv4.def; the engine resolves
+# them at runtime through backend_loader_dsv4.c, mirroring the
+# backend_loader.c / coli_cuda.dll split. Run from a vcvars64 shell, like
+# cuda-dll. Two flavours ship side by side and the loader picks at runtime by
+# compute capability: coli_cuda_dsv4.dll is the GENERIC build (plain CUDA
+# kernels, any sm_80+ card; CUDA_ARCH=portable for a fat binary) and
+# coli_cuda_dsv4_dg.dll the DeepGEMM sm_120a build (tensor-core prefill paths;
+# needs the sm120 DeepGEMM checkout at DEEPGEMM_HOME, see
+# patches-deepgemm-sm120-msvc.patch). Both need -lcuda for the TMA driver API.
+cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor -shared \
+		-Xlinker /DEF:dsv4.def \
+		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
+		backend_cuda_dsv4.cu -o coli_cuda_dsv4.dll
+
+# The DeepGEMM sm120 headers come from tools/fetch_deepgemm.sh (pinned
+# checkout into $(DEEPGEMM_HOME), see the DEEPGEMM block above); this target
+# fetches them on first use.
+DEEPGEMM_INC = -I"$(DEEPGEMM_HOME)/deep_gemm/include" -I"$(DEEPGEMM_HOME)/cutlass/include" -I"$(DEEPGEMM_HOME)/third-party/cutlass/include"
+cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_STAMP)
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
+	"$(NVCC)" -O3 -std=c++20 -ftz=false --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor \
+		-gencode arch=compute_120a,code=sm_120a -DCOLI_DSV4_DEEPGEMM \
+		$(DEEPGEMM_INC) -shared \
+		-Xlinker /DEF:dsv4.def \
+		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
+		backend_cuda_dsv4.cu -o coli_cuda_dsv4_dg.dll
+
+# Windows: the decode-path kernels validated through the runtime DLL loader.
+# deepseek-v4.exe is MinGW gcc; backend_loader_dsv4.c resolves the MSVC/nvcc
+# built coli_cuda_dsv4*.dll and this test proves that ABI boundary.
+dsv4-cuda-loader-test: tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c backend_cuda_dsv4.h
+	$(CC) $(CFLAGS) tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c -o dsv4_decode_loader_test$(EXE)
+	./dsv4_decode_loader_test$(EXE)
+backend_metal.o: backend_metal.mm backend_metal.h affine_quant.h
+	$(METALXX) -c backend_metal.mm -o $@
+
+metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h affine_quant.h
+	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
+	./backend_metal_test
+
+# GLM-5.3 Metal correctness oracles. These exercise the clamped SwiGLU
+
+# primitive and the complete routed gate/up/SwiGLU/down/scatter MoE block
+
+# against their CPU references. Requires real Apple Metal hardware.
+
+.PHONY: glm53-metal-check
+
+glm53-metal-check: backend_metal.o tests/test_glm53_clamped_metal.c tests/test_glm53_moe_block_metal.c
+
+	@test "$(METAL)" = "1" || { echo "usage: make glm53-metal-check METAL=1" >&2; false; }
+
+	$(CC) $(CFLAGS) tests/test_glm53_clamped_metal.c backend_metal.o -o glm53_clamped_metal_test $(LDFLAGS)
+
+	./glm53_clamped_metal_test
+
+	$(CC) $(CFLAGS) tests/test_glm53_moe_block_metal.c backend_metal.o -o glm53_moe_block_metal_test $(LDFLAGS)
+
+	./glm53_moe_block_metal_test
+	$(RM) glm53_clamped_metal_test glm53_moe_block_metal_test
+
+# Standalone large-batch GEMM correctness sweep — reproduces the long-context prefill
+# corruption in seconds (no model). OMP-parallel CPU reference.
+gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h affine_quant.h
+	$(METALXX) $(OMPC) tests/test_gemm_largebatch.mm backend_metal.mm $(OMPL) -framework Metal -framework Foundation -o gemm_largebatch_test
+	./gemm_largebatch_test
+
+# Apple gate: qwen36 routed experts through the MLX affine path, Metal vs
+# the CPU reference -- one-layer MoE parity plus end-to-end logit parity on
+# the tiny hybrid stack. Needs QWEN36_QPACK_FIXTURE=<dir> pointing at a real
+# swiftlet-repack output of tiny-model-q4; without it the binary skips with a
+# distinct marker instead of pretending to pass.
+# The binary has a rule of its own, named after it, so VK=1 can list $(VK_OBJ) as
+# a prerequisite of the link that needs it (qwen36.c calls the backend).
+qwen36-metal-test: qwen36_qpack_metal_test
+	./qwen36_qpack_metal_test
+qwen36_qpack_metal_test: tests/test_qwen36_qpack_metal.c qwen36.c qwen36_qpack.c qwen36_qpack.h qpack.c qpack.h affine_quant.h qwen36_tier.h st.h json.h compat.h backend_metal.o $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_METAL -DQWEN36_QPACK tests/test_qwen36_qpack_metal.c qwen36_qpack.c qpack.c backend_metal.o $(VK_OBJ) -o qwen36_qpack_metal_test -framework Metal -framework Foundation -lc++ $(LDFLAGS)
+
+# fmt=6 (E8/IQ3) encoder for tools/convert_fp8_to_int4.py. OPTIONAL: iq3_pack.py
+# falls back to its numpy path when the library is absent, producing the same
+# bytes ~13x slower. Uses the same ARCH as the engine, so an AVX2 host gets the
+# SIMD search and anything else compiles the scalar fallback.
+ifneq (,$(DARWIN))
+IQ3LIB = tools/libiq3.dylib
+else ifneq ($(IS_WIN),)
+IQ3LIB = tools/iq3.dll
+else
+IQ3LIB = tools/libiq3.so
+endif
+iq3: $(IQ3LIB)
+$(IQ3LIB): tools/iq3_encode.c
+	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
+
+# int4-rans256-g0 codec bridge for tools/repack_rans.py + tools/rans_verify.py.
+# OPTIONAL: both tools fall back to a pure-Python codec producing the same
+# bytes far more slowly when the library is absent (fine for tests, not for a
+# real repack). Same ARCH story as the engine: an AVX-512/NEON host gets the
+# batched vector decoder, anything else the scalar paths.
+ifneq (,$(DARWIN))
+RANSLIB = tools/librans_c.dylib
+else ifneq ($(IS_WIN),)
+RANSLIB = tools/rans_c.dll
+else
+RANSLIB = tools/librans_c.so
+endif
+rans: $(RANSLIB)
+$(RANSLIB): tools/rans_ctypes.c
+	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
+
+cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./backend_cuda_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_init_failure.cu -o cuda_init_failure_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./cuda_init_failure_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
+	./ragged_attention_test$(EXE)
+	# weight_at's device-side refusal (the __trap()) on real silicon. The
+	# host-side half is tests/test_cuda_fmt_guard.c, which runs in the CPU
+	# suite and cannot execute device code. Includes backend_cuda.cu itself:
+	# weight_at is file-static, and the trap is unreachable through the public
+	# API by design. Re-execs itself per probe (the trap poisons the context).
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./cuda_fmt_trap_test$(EXE)
+	# fmt=8 warp kernels (COLI_CUDA_F8_WARP): decode sweep, census + tail
+	# shapes, S-invariance, NaN/denormal policy. Includes backend_cuda.cu
+	# itself (kernel-level oracle), so only the test file is compiled.
+	# Runs BEFORE the MXFP4 test: that one has a pre-existing exponent-255
+	# failure on some hosts and would otherwise abort the recipe first.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./fp8_warp_test$(EXE)
+	# The batch and ragged absorb kernels must reproduce their own output: they
+	# reduce in a fixed tree order with no atomics, so two identical launches
+	# that disagree have read shared memory another thread was still writing.
+	# Needs both an oversubscribed grid and a token count in the affected band
+	# (roughly 33..256 per block) to reach the output; the sweep covers both,
+	# and one cell sits above the band on purpose. See the test's header.
+	# Runs AFTER the fp8 test on purpose: this is the most schedule-sensitive
+	# test in the recipe, and it should not cost the broader kernel suites if
+	# it trips. It stays BEFORE MXFP4 so it still runs on the hosts where that
+	# one is expected to fail.
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE) $(GPU_TEST_LIBS)
+	./absorb_determinism_test$(EXE)
+	# fmt=8 (fp8-e4m3) kernel oracle + public API (LUT gate, dense, expert
+	# group, byte accounting). Includes backend_cuda.cu itself, so only the
+	# test file is compiled. Also runs BEFORE the MXFP4 test (same reason).
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_cuda.cu -o fp8_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./fp8_cuda_test$(EXE)
+	# Upload-failure ownership: a failed H2D weight copy must release the
+	# bytes it allocated (weights_owned set by the malloc, not the copy).
+	# Includes backend_cuda.cu itself to plant the memcpy failure, so only
+	# the test file is compiled.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./weights_owned_test$(EXE)
+	# MXFP4 (fmt=7) against the CPU decoder in quant.h. The reference is built
+	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
+	# rejects, and re-implementing it for the test would defeat the comparison.
+	# Built WITHOUT OpenMP (#971). This is a correctness oracle over matrices of
+	# at most S=4 I=2048 O=64, so threading it buys nothing measurable, while the
+	# dependency it creates has blocked this target on two hosts: a Linux box
+	# whose libgomp is absent (undefined reference to GOMP_parallel, at this very
+	# link step) and MSVC, whose OpenMP predates C99 loop declarations in C mode.
+	# It was also the only reason the final nvcc/hipcc link here had to drag in
+	# the host OpenMP runtime, so GPU_OMP_LINK goes with it.
+	# The OpenMP flags are FILTERED OUT rather than overridden with -fno-openmp
+	# alone: on macOS they arrive as `-Xclang -fopenmp`, which goes straight to
+	# the frontend and is not necessarily undone by a driver-level -fno-openmp.
+	# Getting that wrong would leave OpenMP symbols in the object while the link
+	# below no longer pulls the runtime, and CI could not catch it because CI
+	# never runs cuda-test. -Xclang appears nowhere else in CFLAGS.
+	$(CC) $(filter-out -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -fPIC -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
+	# -x none only under HIP: hip-test is `$(MAKE) cuda-test HIP=1`, so this
+	# line also runs under nvcc for CUDA users, and nvcc accepts only c, c++
+	# and cu for -x -- it fails the invocation on anything else. CI never
+	# executes cuda-test, so that breakage would surface only on the next
+	# CUDA box to run the suite.
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu $(if $(filter 1,$(HIP)),-x none) tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) $(GPU_TEST_LIBS)
+	./mxfp4_cuda_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_expert_cuda.cu $(if $(filter 1,$(HIP)),-x none) tests/mxfp4_ref.o -o mxfp4_expert_cuda_test$(EXE) $(GPU_TEST_LIBS)
+	./mxfp4_expert_cuda_test$(EXE)
+	# Allocator footprint (#687): what a cudaMalloc really takes off the card,
+	# which is what the expert tier has to be charged rather than the logical
+	# byte count. Runs LAST on purpose - it is the only test here that
+	# allocates in bulk to measure an amortised cost, so it should not leave
+	# the card fragmented underneath a kernel test that follows it.
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_alloc_footprint_cuda.cu -o alloc_footprint_test$(EXE) $(GPU_TEST_LIBS)
+	./alloc_footprint_test$(EXE)
+
+
+# The DeepSeek V4 kernels on their own: dense, batched attention and routed MoE
+# against the CPU reference in each test. Needs a GPU, so CI compiles it via
+# gpu-compile rather than running it.
+dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+	$(CC) $(CFLAGS) tests/test_dsv4_dense_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_attention_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_attention_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_attention_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_moe_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_moe_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_moe_cuda_test$(EXE)
+
+# Pure-CPU unit tests for the two headers the kernels consume. No GPU, no model.
+tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c
+	$(CC) $(CFLAGS) tests/test_dsv4_mhc.c -o tests/test_dsv4_mhc$(EXE) $(LDFLAGS)
+
+tests/test_dsv4_quant$(EXE): tests/test_dsv4_quant.c
+	$(CC) $(CFLAGS) tests/test_dsv4_quant.c -o tests/test_dsv4_quant$(EXE) $(LDFLAGS)
+# convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
+hip-test:
+	$(MAKE) cuda-test HIP=1
+
+# CI: compile the backend and its test binary WITHOUT executing them (for
+# runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
+gpu-compile: backend_cuda.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+
+cuda-bench: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/bench_tensor_core.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE) $(ANS_NVCC_LIBS)
+	./backend_cuda_bench$(EXE)
+
+# fmt=8 kernel bench: old vs COLI_CUDA_F8_WARP kernels per decode path, census
+# expert shapes, JSON on stdout (kernel time only). The build is a separate
+# file target so tools/run_f8_bench.sh can keep stdout pure JSON.
+fp8_bench$(EXE): backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/bench_fp8_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) tests/bench_fp8_cuda.cu -o fp8_bench$(EXE) $(ANS_NVCC_LIBS)
+fp8-bench: fp8_bench$(EXE)
+	./fp8_bench$(EXE)
+
+# Matched resident int8 GPU projection timings; run explicitly, not in CI.
+tests/bench_cuda_resident_batch$(EXE): tests/bench_cuda_resident_batch.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_cuda_resident_batch.cu -o $@ $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+
+# NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
+# hand it a define matching nothing and link a runtime it never calls -- a
+# build whose compile line, libraries and exit status all claim "CUDA" while
+# the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
+# MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
+# asserts this shape.
+ifneq ($(EXE),)
+.PHONY: olmoe
+olmoe: olmoe$(EXE)
+endif
+olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
+
+# Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
+# MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
+# in and reuses the shared CUDA backend; without it the engine is CPU-only
+# (qwen36_tier.h provides inline stubs).
+#
+# The flags follow the same switch. Without CUDA=1 this target keeps the
+# NOCUDA_* flags it got when the engine had no CUDA at all: compiling
+# -DCOLI_CUDA and linking -lcudart for a build that calls neither only made
+# `make qwen36` depend on a toolkit it never touches. With CUDA=1 the tier is
+# real CUDA and takes the normal flags back.
+# CUDA_DLL=1 / HIP_DLL=1 are the Windows spellings (CUDA=1 is refused there):
+# the tier compiles in through the runtime loader exactly as it does through
+# the direct link, or `make qwen36.exe CUDA_DLL=1` silently produced a CPU-only
+# engine (#1533).
+ifneq (,$(filter 1,$(CUDA) $(CUDA_DLL) $(HIP) $(HIP_DLL)))
+QWEN36_TIER_OBJ = qwen36_tier.o
+QWEN36_CFLAGS   = $(CFLAGS)
+QWEN36_LDFLAGS  = $(LDFLAGS)
+else
+QWEN36_TIER_OBJ =
+QWEN36_CFLAGS   = $(NOCUDA_CFLAGS)
+QWEN36_LDFLAGS  = $(NOCUDA_LDFLAGS)
+endif
+# The tier is its own object rather than a second source on each engine's
+# command line: GCC writes a .d for only the LAST unit of a multi-source
+# compile, so qwen36.c's headers would drop out of qwen36.d whenever the tier
+# is built in (#1741). Same $(CFLAGS) the one-command build gave it: in this
+# configuration QWEN36_CFLAGS is $(CFLAGS).
+qwen36_tier.o: qwen36_tier.c .build-config
+	$(CC) $(CFLAGS) -c qwen36_tier.c -o $@
+# On Windows, EXE=.exe.  Keep a bare qwen36 target so GNU make does not
+# fall through to its implicit %: %.c rule and compile qwen36.c alone.
+ifneq ($(EXE),)
+.PHONY: qwen36
+qwen36: qwen36$(EXE)
+endif
+# Apple METAL=1 engine builds also compile the qpack MLX-affine routed-
+# expert path (activated at runtime by QWEN36_QPACK=<container dir>); other
+# builds keep the inline stubs in qwen36_qpack.h and change nothing.
+QWEN36_QPACK_OBJ =
+ifeq ($(METAL),1)
+QWEN36_QPACK_OBJ = qwen36_qpack.o qpack.o
+QWEN36_CFLAGS  += -DQWEN36_QPACK
+endif
+# As objects rather than extra units on qwen36's command line (#1741), with
+# the flags that line gave them.
+qwen36_qpack.o: qwen36_qpack.c .build-config
+	$(CC) $(QWEN36_CFLAGS) -c qwen36_qpack.c -o $@
+qpack.o: qpack.c .build-config
+	$(CC) $(QWEN36_CFLAGS) -c qpack.c -o $@
+# Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
+# be reported as up to date despite selecting the Windows CUDA DLL tier.
+qwen36$(EXE): qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+
+# Qwen-Image-2.1 text-to-image (docs/qwen-image.md). It reads the diffusers
+# checkpoint as it is: no conversion step. qi_gemm.h is its one matrix kernel.
+ifneq ($(EXE),)
+.PHONY: qwenimage
+qwenimage: qwenimage$(EXE)
+endif
+qwenimage$(EXE): qwenimage.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) qwenimage.c $(VK_OBJ) -o qwenimage$(EXE) $(LDFLAGS)
+
+# Laya (Convai Innovations), a decision model: ModernBERT encoder + decision
+# head, served on POST /v1/systemone through the DECIDE command (docs/laya.md).
+# One file; qi_gemm.h is its matrix kernel, decide_serve.h its serve loop.
+ifneq ($(EXE),)
+.PHONY: laya
+laya: laya$(EXE)
+endif
+laya$(EXE): laya.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) laya.c $(VK_OBJ) -o laya$(EXE) $(LDFLAGS)
+
+# GLiNER2.5-Decide (fastino), a decision model: DeBERTa-v3 encoder + GLiNER2's
+# classification head, served on POST /v1/systemone through the DECIDE command
+# (docs/gliner_decide.md). Its gliner_unicode.h is generated by
+# tools/gen_gliner_unicode.py (Python's own \w, \s and str.lower()).
+ifneq ($(EXE),)
+.PHONY: gliner_decide
+gliner_decide: gliner_decide$(EXE)
+endif
+gliner_decide$(EXE): gliner_decide.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) gliner_decide.c $(VK_OBJ) -o gliner_decide$(EXE) $(LDFLAGS)
+
+# Tiny Laya checkpoint + the laya package's own answers on it. The generator is
+# numpy and deterministic; laya_tiny/ref.json is committed and comes from the
+# `laya` package (tools/make_laya_ref.py, maintainer-run, fixture SHA-256
+# pinned), so CI needs neither torch nor network. The second module is the same
+# fixture through `coli serve`'s gateway: POST /v1/systemone end to end.
+.PHONY: laya-tiny-generate laya-tiny-check
+laya-tiny-generate:
+	$(PYTHON) tools/make_laya_tiny.py --output ./laya_tiny
+
+laya-tiny-check: laya-tiny-generate laya$(EXE)
+	LAYA_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_laya_tiny tests.test_decision_serve
+
+# Tiny GLiNER2.5-Decide checkpoint + the gliner2 package's own answers on it,
+# the same arrangement: tools/make_gliner_decide_tiny.py (numpy, deterministic)
+# writes the checkpoint, gliner_decide_tiny/ref.json is committed and comes from
+# the `gliner2` package (tools/make_gliner_decide_ref.py, maintainer-run,
+# fixture SHA-256 pinned). The second module serves the fixture through the
+# gateway: POST /v1/systemone end to end.
+.PHONY: gliner-decide-tiny-generate gliner-decide-tiny-check
+gliner-decide-tiny-generate:
+	$(PYTHON) tools/make_gliner_decide_tiny.py --output ./gliner_decide_tiny
+
+gliner-decide-tiny-check: gliner-decide-tiny-generate gliner_decide$(EXE)
+	GLINER_DECIDE_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_gliner_decide_tiny tests.test_decision_serve
+
+# Tiny Clef checkpoint (Cloudflare/clef's layout at toy widths) + the answers of
+# Clef's own joint_schema_model.py on it. The generator is numpy and
+# deterministic, the converter is the one users run (torch + safetensors);
+# clef_tiny/ref.json is committed and comes from tools/make_clef_ref.py
+# (maintainer-run, transformers 5.10.2, fixture SHA-256 pinned). The second
+# module is the same fixture through `coli serve`: POST /v1/systemone and a chat.
+.PHONY: clef-tiny-generate clef-tiny-check
+clef-tiny-generate:
+	$(PYTHON) tools/make_clef_tiny.py --output ./clef_tiny
+	$(PYTHON) tools/convert_qwen36.py --model ./clef_tiny --out ./clef_tiny_c --ebits 8 --no-readme >/dev/null
+
+clef-tiny-check: clef-tiny-generate qwen36$(EXE)
+	CLEF_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_clef_tiny tests.test_decision_serve
+
+# TypeSafe's own SDKs (Python and TypeScript), unmodified, against `coli serve`
+# on a language model (tiny MiMo), the decision engines (tiny Laya, tiny
+# GLiNER2.5-Decide) and a chat model with a decision head (tiny Clef on qwen36):
+# switching from Jev is a base-URL change. Needs the pinned SDKs first, and
+# torch for the Clef converter:
+#   pip install -r tools/requirements-jev-sdk.txt && (cd tools/jev-sdk && npm ci)
+.PHONY: jev-sdk-check
+jev-sdk-check: mimo$(EXE) laya$(EXE) gliner_decide$(EXE) qwen36$(EXE) mimo-tiny-generate \
+		laya-tiny-generate gliner-decide-tiny-generate clef-tiny-generate
+	JEV_SDK_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_jev_sdk
+
+# In make check: every format and ragged edges against the naive product, and
+# the int8 x int8 VNNI path against the exact integer sum.
+tests/test_qi_gemm$(EXE): tests/test_qi_gemm.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
+# stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
+# are, so there is no conversion target here to go with it.
+ifneq ($(EXE),)
+.PHONY: deepseek_v41
+deepseek_v41: deepseek_v41$(EXE)
+endif
+deepseek_v41$(EXE): deepseek_v41.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) deepseek_v41.c $(VK_OBJ) -o deepseek_v41$(EXE) $(LDFLAGS)
+
+# Xiaomi MiMo-V2.6 (Flash 309B, Pro 1.02T): one file plus its ViT header, reading the
+# release as it is -- MXFP4 experts streamed per layer, FP8/BF16 dense resident.
+ifneq ($(EXE),)
+.PHONY: mimo
+mimo: mimo$(EXE)
+endif
+mimo$(EXE): mimo.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) mimo.c $(VK_OBJ) -o mimo$(EXE) $(LDFLAGS)
+
+# Tiny MiMo fixture + vendor oracle, the Kimi K3 pattern: the generator is numpy (and
+# Pillow for the test picture) and deterministic; ref.json is committed and comes from
+# Xiaomi's own modeling code (tools/make_mimo_ref.py, maintainer-run, SHA-256-pinned),
+# so CI needs neither torch nor network. The fixture carries the vision tower too.
+.PHONY: mimo-tiny-generate mimo-tiny-check
+mimo-tiny-generate:
+	$(PYTHON) tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
+
+mimo-tiny-check: mimo-tiny-generate mimo$(EXE)
+	$(PYTHON) tests/mimo_tiny_harness.py --binary ./mimo$(EXE) --fixture ./mimo_tiny
+
+# The same fixture served: KV prefix reuse, System One photos (the windowed layers'
+# rings, pictures, nested and stale photos), and /v1/systemone and chat logprobs
+# through the gateway. Every comparison is against a cold engine.
+.PHONY: mimo-tiny-serve-check
+mimo-tiny-serve-check: mimo-tiny-generate mimo$(EXE)
+	$(PYTHON) -m unittest -v tests.test_mimo_prefix_serve tests.test_brio_serve.MimoBrioServe \
+		tests.test_systemone_api.MimoSystemOneEndToEnd
+
+# Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint
+# loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
+# qwen36 (fp8 streaming mode: hot experts get VRAM copies, the RAM LRU stays);
+# without it the tier header's inline stubs keep the build toolkit-free.
+ifneq ($(EXE),)
+.PHONY: qwen38
+qwen38: qwen38$(EXE)
+endif
+qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
+
+.PHONY: qwen38-tiny-generate qwen38-tiny-check
+qwen38-tiny-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny
+
+# Il prefetch PLE e' un riordino, non un cambio di calcolo: le stesse righe,
+# lette prima e in parallelo. Quindi acceso e spento devono dare gli STESSI
+# token, e questo lo pretende invece di fidarsi. Se un giorno divergono, il
+# prefetch ha smesso di essere un riordino e va guardato, non spento.
+.PHONY: qwen38-ple-prefetch-check
+qwen38-ple-prefetch-check: qwen38-tiny-generate qwen38$(EXE)
+	@fail=0; for cap in 1 2 4 8; do for pb in 0 1; do for bf in 0 1; do \
+		on=$$(Q38_PREFILL_BATCH=$$pb Q38_NATIVE_BF16=$$bf OMP_NUM_THREADS=2 SNAP=./qwen38_tiny ./qwen38$(EXE) $$cap 8 ./qwen38_tiny/ref.json 2>/dev/null | grep '^C engine'); \
+		off=$$(Q38_PLE_PREFETCH=0 Q38_PREFILL_BATCH=$$pb Q38_NATIVE_BF16=$$bf OMP_NUM_THREADS=2 SNAP=./qwen38_tiny ./qwen38$(EXE) $$cap 8 ./qwen38_tiny/ref.json 2>/dev/null | grep '^C engine'); \
+		if [ -z "$$on" ]; then echo "FAIL cap=$$cap batch=$$pb bf16=$$bf: no output"; fail=1; \
+		elif [ "$$on" != "$$off" ]; then echo "FAIL cap=$$cap batch=$$pb bf16=$$bf: prefetch changes the tokens"; fail=1; fi; \
+	done; done; done; \
+	[ $$fail -eq 0 ] && echo "PLE prefetch: identical tokens on and off, 16 configurations" || exit 1
+
+# Q38_TRUNK_MIN_KB=0 puts every dense matrix of the fixture (all under the
+# default 1 MiB threshold) on the int8 trunk with integer dot products, the
+# path the released checkpoint takes; 1024 leaves them BF16.
+qwen38-tiny-check: qwen38-tiny-generate qwen38$(EXE)
+	@for trunk in 1024 0; do for batch in 0 1; do for bf16 in 0 1; do for cap in 1 4; do \
+		Q38_TRUNK_MIN_KB=$$trunk Q38_PREFILL_BATCH=$$batch Q38_NATIVE_BF16=$$bf16 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny ./qwen38$(EXE) $$cap 8 ./qwen38_tiny/ref.json || exit $$?; \
+	done; \
+	done; \
+	done; \
+	done
+
+# Same oracle with the routed experts as the release ships them: e4m3 bytes
+# plus BF16 128x128 block scales, gate/up and down in separate shards. The
+# native slab path and the expanded path must both reproduce the reference;
+# then the engine runs on the fake CUDA tier (no toolkit, no GPU).
+.PHONY: qwen38-tiny-fp8-generate qwen38-tiny-fp8-check qwen38-tier-engine-check
+qwen38-tiny-fp8-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_fp8 --fp8-experts
+
+qwen38-tiny-fp8-check: qwen38-tiny-fp8-generate qwen38$(EXE)
+	@for trunk in 1024 0; do for native in 1 0; do for cap in 1 2; do \
+		Q38_TRUNK_MIN_KB=$$trunk Q38_NATIVE_FP8=$$native OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_fp8 ./qwen38$(EXE) $$cap 8 ./qwen38_tiny_fp8/ref.json || exit $$?; \
+	done; \
+	done; \
+	done
+
+qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine$(EXE)
+	./tests/test_qwen38_tier_engine$(EXE)
+
+qwen38-dn-gpu-check: qwen38-tiny-fp8-generate tests/test_qwen38_dn_gpu$(EXE)
+	./tests/test_qwen38_dn_gpu$(EXE)
+
+# The routed experts as int4-g64: tools/convert_qwen38_experts_int4.py writes
+# the experts-int4g64/ sidecar next to the FP8 shards and qwen38 picks it up.
+# The fixture is the FP8 one with its experts scaled by 3 (at the default
+# initialization zeroing every expert moves the logits less than the oracle's
+# tolerance), converted; ref_int4.json is the float32 reference of the
+# dequantized sidecar. Gates:
+#  (a) the int4 matmul equals a dequantized f32 reference, and every expert the
+#      single and the batch path load holds the sidecar's bytes
+#      (tests/test_qwen38_int4_experts);
+#  (b) the converter's round trip against the FP8 source, per matrix, and the
+#      engine refusing a sidecar its index does not describe
+#      (tests/test_qwen38_int4_convert.py);
+#  (c) the engine on the sidecar reproduces ref_int4.json through the single,
+#      batched, prefill-batch and mapped paths at caps 1, 2 and 4, with the
+#      last logits identical to the bit across them; the FP8 experts still
+#      reproduce ref.json and not ref_int4.json, so the gate tells them apart;
+#  (d) under COLI_CUDA=1 on the fake backend the tier declines the int4
+#      experts (it streams FP8 only) and the CPU still reproduces ref_int4.json.
+.PHONY: qwen38-tiny-int4-generate qwen38-tiny-int4-check
+qwen38-tiny-int4-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_int4 --fp8-experts --int4-experts --expert-gain 3
+
+qwen38-tiny-int4-check: qwen38-tiny-int4-generate qwen38-tiny-fp8-generate qwen38$(EXE) \
+		tests/test_qwen38_int4_experts$(EXE) tests/test_qwen38_tier_engine$(EXE)
+	OMP_NUM_THREADS=2 ./tests/test_qwen38_int4_experts$(EXE) ./qwen38_tiny_int4
+	$(PYTHON) tests/test_qwen38_int4_convert.py --model ./qwen38_tiny_int4 --engine ./qwen38$(EXE)
+	@d=./qwen38_tiny_int4/logits; rm -rf $$d; mkdir -p $$d; n=0; \
+	for trunk in 1024 0; do for cap in 1 2 4; do for mode in single batched prefill prefill-serial mapped; do \
+		case $$mode in \
+			single) e="Q38_PREFILL_BATCH=0 Q38_EXPERT_PARALLEL_READS=0";; \
+			batched) e="Q38_PREFILL_BATCH=0";; \
+			prefill) e="Q38_PREFILL_BATCH=1";; \
+			prefill-serial) e="Q38_PREFILL_BATCH=1 Q38_EXPERT_PARALLEL_READS=0";; \
+			mapped) e="COLI_MAP_EXPERTS=1";; \
+		esac; \
+		env $$e Q38_EXPERT_INT4=1 Q38_TRUNK_MIN_KB=$$trunk DUMP=$$d/t$$trunk-c$$cap-$$mode.f32 OMP_NUM_THREADS=2 \
+			SNAP=./qwen38_tiny_int4 ./qwen38$(EXE) $$cap 8 ./qwen38_tiny_int4/ref_int4.json > $$d/run.log 2>&1 \
+			|| { cat $$d/run.log; echo "FAIL int4 experts, trunk=$$trunk cap=$$cap $$mode"; exit 1; }; \
+		n=$$((n+1)); \
+	done; done; \
+	for f in $$d/t$$trunk-*.f32; do cmp -s $$f $$d/t$$trunk-c1-single.f32 \
+		|| { echo "FAIL $$f: last logits differ from the single path"; exit 1; }; done; done; \
+	for trunk in 1024 0; do \
+		Q38_EXPERT_INT4=0 Q38_TRUNK_MIN_KB=$$trunk OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_int4 \
+			./qwen38$(EXE) 2 8 ./qwen38_tiny_int4/ref.json > $$d/run.log 2>&1 \
+			|| { cat $$d/run.log; echo "FAIL FP8 experts of the int4 fixture, trunk=$$trunk"; exit 1; }; \
+		if Q38_EXPERT_INT4=0 Q38_TRUNK_MIN_KB=$$trunk OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_int4 \
+			./qwen38$(EXE) 2 8 ./qwen38_tiny_int4/ref_int4.json > $$d/run.log 2>&1 \
+			|| ! grep -q '^Matching tokens' $$d/run.log; then \
+			cat $$d/run.log; echo "FAIL the FP8 experts pass the int4 reference: the gate cannot tell them apart"; exit 1; fi; \
+	done; \
+	echo "qwen38 int4-g64 experts: ref_int4.json reproduced in $$n configurations, last logits identical across paths; FP8 control ok"
+	./tests/test_qwen38_tier_engine$(EXE) ./qwen38_tiny_int4
+
+# Speculative decoding with the checkpoint's MTP head (Q38_MTP=1; qwen38_core.h,
+# "the MTP head"). The fixtures are the three above plus an MTP head (--mtp:
+# random head weights from their own seed under the release's mtp.* names; the
+# model and its references do not change) and a byte tokenizer for the text
+# and serve gates. tests/qwen38_mtp_harness.py checks:
+#  (a) the head's draft logits equal tools/qwen38_mtp_ref.py's float32
+#      reference for the default wiring b and the diagnostic a, through the
+#      one-row and the two-row (after an accepted draft) paths, on BF16 and
+#      FP8 experts;
+#  (b) decoding with drafts is byte-identical to Q38_MTP=0 (stdout and last
+#      logits) at caps 1/2/8, prefill batching on and off, BF16 and int8
+#      trunk, on BF16, FP8 and int4-g64 experts, in the normal mode and with
+#      Q38_MTP_FORCE=reject (a rollback at every token), accept and mixed,
+#      whose acceptance and tokens/forward must be the loop's own count;
+#  (c) a 40-token text decode and a five-turn serve session (prompt cache,
+#      pin, logprobs, a sampled turn) are byte-identical with drafts, and the
+#      head's drafts after a restored prefix or pin equal a fresh session's.
+.PHONY: qwen38-tiny-mtp-generate qwen38-tiny-mtp-check
+qwen38-tiny-mtp-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_mtp --mtp
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_fp8_mtp --fp8-experts --mtp
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
+	@for d in qwen38_tiny_mtp qwen38_tiny_fp8_mtp qwen38_tiny_int4_mtp; do \
+		$(PYTHON) tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./$$d || exit $$?; done
+
+qwen38-tiny-mtp-check: qwen38-tiny-mtp-generate qwen38$(EXE)
+	$(PYTHON) tests/qwen38_mtp_harness.py --engine ./qwen38$(EXE) --bf16 ./qwen38_tiny_mtp \
+		--fp8 ./qwen38_tiny_fp8_mtp --int4 ./qwen38_tiny_int4_mtp
+
+# Speculative decoding with deeper verifies (docs/speculative.md): the MTP head's
+# drafts up to 3 per verify (Q38_MTP_DRAFTS) and prompt-lookup drafts up to 5
+# (COLI_LOOKUP=1, spec_draft.h), on qwen38 and qwen36. tests/test_spec_draft
+# checks the lookup and the gate on their own; tests/spec_drafts_harness.py gates
+# every depth and every rejected row against plain decoding (tokens and last logits
+# byte-identical, the forced modes' counts exact), and serve sessions with prefix
+# reuse, pins and turns that end inside a verify. The qwen36 fixtures have an ASCII
+# vocabulary (--vocab 128), so a reply resent as text reads back as the ids the
+# engine generated. SPEC_ENV passes more settings to every run (the Vulkan family
+# in tests/vulkan_engines.sh runs the same gates in the dense chain).
+.PHONY: qwen36-tiny-v128-generate spec-drafts-check spec-drafts-run
+qwen36-tiny-v128-generate:
+	$(PYTHON) tools/make_qwen36_tiny.py --out ./qwen36_tiny_v128 --ref-mode full --vocab 128 \
+		--emit-ref ./qwen36_tiny_v128/ref_full.json
+	$(PYTHON) tools/convert_qwen36.py --model ./qwen36_tiny_v128 --out ./qwen36_tiny_v128_c --ebits 8
+	$(PYTHON) tools/make_qwen36_tiny.py --out ./qwen36_tiny64_v128 --ref-mode full --vocab 128 --inter 64 \
+		--emit-ref ./qwen36_tiny64_v128/ref_full.json
+	$(PYTHON) tools/convert_qwen36.py --model ./qwen36_tiny64_v128 --out ./qwen36_tiny64_v128_c --ebits 4 --gs 64
+
+tests/test_spec_draft$(EXE): tests/test_spec_draft.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qwen38_spec_alloc$(EXE): tests/test_qwen38_spec_alloc.c qwen38.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+SPEC_HARNESS = $(PYTHON) tests/spec_drafts_harness.py
+spec-drafts-check: qwen38-tiny-mtp-generate qwen36-tiny-v128-generate
+	$(MAKE) spec-drafts-run
+
+# the gates alone, on fixtures already generated (spec-drafts-check makes them)
+spec-drafts-run: qwen38$(EXE) qwen36$(EXE) tests/test_spec_draft$(EXE) tests/test_qwen38_spec_alloc$(EXE)
+	./tests/test_spec_draft$(EXE)
+	./tests/test_qwen38_spec_alloc$(EXE)
+	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp --serve $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_fp8_mtp --mtp \
+		--env Q38_PREFILL_BATCH=0 $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_int4_mtp \
+		--ref ./qwen38_tiny_int4_mtp/ref_int4.json --mtp --env Q38_EXPERT_INT4=1 --env Q38_TRUNK_MIN_KB=0 $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen36$(EXE) --kind qwen36 --fixture ./qwen36_tiny_v128_c \
+		--ref ./qwen36_tiny_v128/ref_full.json --cap 8 --n-new 64 --serve --env COLI_DENSE_I8=0 $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen36$(EXE) --kind qwen36 --fixture ./qwen36_tiny_v128_c \
+		--ref ./qwen36_tiny_v128/ref_full.json --cap 1 --n-new 64 $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen36$(EXE) --kind qwen36 --fixture ./qwen36_tiny64_v128_c \
+		--ref ./qwen36_tiny64_v128/ref_full.json --cap 8 --n-new 64 $(SPEC_ENV)
+
+# Context-size gates: KV layout, growth across requests, and the attention
+# capacity. Includes qwen36.c directly, so no model file is needed.
+# Same tier objects as the engine: the test includes qwen36.c, so with CUDA=1
+# it links qwen36_tier.o and the backend object too (without CUDA, the header's
+# inline stubs cover it and both are empty).
+tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_qwen36_weight_alloc$(EXE): tests/test_qwen36_weight_alloc.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# CACHE_ROUTE: route_select() against a residency table, no model needed.
+tests/test_qwen36_cache_route$(EXE): tests/test_qwen36_cache_route.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# CPU gate: the qpack MLX-affine routed-expert glue (qwen36_qpack.c)
+# against the portable affine reference, on a synthesized container -- no
+# GPU, every platform. The Apple parity twin (Metal vs CPU reference on a
+# real Swiftlet-generated fixture) is the qwen36-metal-test target.
+tests/test_qwen36_qpack$(EXE): tests/test_qwen36_qpack.c qwen36.c tests/qwen36_qpack.o tests/qpack_qwen36.o $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) -DQWEN36_QPACK $< tests/qwen36_qpack.o tests/qpack_qwen36.o $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+# qwen36_qpack.c and qpack.c as objects, compiled with the flags this test gave
+# them on the same command line before (#1741): one unit per command.
+tests/qwen36_qpack.o: qwen36_qpack.c .build-config
+	$(CC) $(QWEN36_CFLAGS) -DQWEN36_QPACK -c qwen36_qpack.c -o $@
+tests/qpack_qwen36.o: qpack.c .build-config
+	$(CC) $(QWEN36_CFLAGS) -DQWEN36_QPACK -c qpack.c -o $@
+
+tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# Dense-bridge gate: qwen36's loader against an MLX affine
+# model.safetensors (the dense half of a Swiftlet qpack container) --
+# `language_model.` name resolution, U32 triple indexing, checked Q4/Q8
+# expansion, refusals.  With argv it doubles as the round-trip harness for
+# tests/test_make_qwen36_qpack_snap.py.
+tests/test_qwen36_dense_affine$(EXE): tests/test_qwen36_dense_affine.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# Both tokenizer.json merge spellings ("a b" strings and ["a","b"] pairs)
+# must index the same merge table; the pair form is what Qwen3.6 ships.
+tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# A byte-counted serving payload may end mid-character; the pre-tokenizer must
+# not read past it.  qwen38 already gates this (tests/test_qwen38_tokenizer.c).
+tests/test_qwen36_tok_truncated$(EXE): tests/test_qwen36_tok_truncated.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# push_id / bpe_piece must refuse loudly, not crash, on a failed realloc during growth.
+tests/test_qwen36_encode_oom$(EXE): tests/test_qwen36_encode_oom.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# slot_ensure_int8's wiring onto #1271's unpack_int4_to_int8: regression check
+# that its output matches the old separate scalar nibble-unpack loop it replaced.
+tests/test_qwen36_slot_int8$(EXE): tests/test_qwen36_slot_int8.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# qwen36_cap_for_ram(): the cap<=0 "auto" sentinel's RAM-derived slot count.
+tests/test_qwen36_cap_precedence$(EXE): tests/test_qwen36_cap_precedence.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# the dense trunk's integer path: quantizer contract, int4 planar packing, dispatch.
+tests/test_qwen36_dense_idot$(EXE): tests/test_qwen36_dense_idot.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# #1653: added tokens are split out before the regex pre-tokenizer, HF-style.
+tests/test_qwen36_tokenizer$(EXE): tests/test_qwen36_tokenizer.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# Reproducible local timing evidence; intentionally not a noisy CI perf gate.
+tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c \
+		$(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+ifneq ($(EXE),)
+.PHONY: inkling
+inkling: inkling$(EXE)
+endif
+inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o inkling$(EXE) $(LDFLAGS)
+
+# ENGINES WITHOUT A CUDA BACKEND (#783).
+# kimi_k3.c contains no COLI_CUDA code at all — its GPU path is Vulkan. But
+# CUDA=1 appends -DCOLI_CUDA to the global CFLAGS and the cudart libs to
+# LDFLAGS, so `make kimi_k3 CUDA=1` used to compile a define that matches
+# nothing, link a runtime it never calls, and emit no warning: every
+# observable signal said "CUDA build" and the GPUs stayed idle. Strip the
+# flags for these targets and say so once, loudly.
+comma := ,
+NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
+NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
+                   -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
+
+# GLM-5.3-Flash: routed experts stream from the int4-gs64 container.
+# METAL=1 accelerates resident matrices and routed MoE; CPU remains fallback.
+ifneq ($(EXE),)
+.PHONY: glm53
+glm53: glm53$(EXE)
+endif
+glm53$(EXE): glm53.c $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) glm53.c $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
+
+ifneq ($(EXE),)
+.PHONY: kimi_k3
+kimi_k3: kimi_k3$(EXE)
+endif
+kimi_k3$(EXE): kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ) .build-config
+	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
+
+# Use a baseline that matches the compiler target. macOS already targets a
+# portable baseline when ARCH is empty; forcing the x86 value there breaks
+# Apple Silicon. Unknown targets use native rather than an invalid x86 flag.
+# Intel Macs need -march for vector instructions
+ifneq (,$(DARWIN))
+PORTABLE_ARCH = $(if $(X86_64),x86-64-v3,)
+else ifneq (,$(AARCH64))
+PORTABLE_ARCH = armv8-a
+else ifneq (,$(PPC64))
+PORTABLE_ARCH = power8
+else ifneq (,$(X86_64))
+PORTABLE_ARCH = x86-64-v3
+else
+PORTABLE_ARCH = native
+endif
+
+portable:
+	$(MAKE) colibri$(EXE) ARCH=$(PORTABLE_ARCH)
+
+ifneq ($(EXE),)
+.PHONY: iobench
+iobench: iobench$(EXE)
+endif
+iobench$(EXE): iobench.c
+	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
+
+qpack-inspect$(EXE): qpack_inspect.c qpack.c qpack.h affine_quant.h json.h compat.h
+	$(CC) $(CFLAGS) qpack_inspect.c qpack.c -o qpack-inspect$(EXE) $(LDFLAGS)
+
+tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_cluster_protocol$(EXE): tests/test_cluster_protocol.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_ue8m0$(EXE): tests/test_ue8m0.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Compiles the engine with -DCOLI_XDNA so the QT side pointer, its reset helper
+# and the expert-slot wiring are exercised as the engine actually builds them.
+tests/test_xdna_qt_state$(EXE): tests/test_xdna_qt_state.c colibri.c tests/backend_xdna_lane.o $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< tests/backend_xdna_lane.o $(VK_OBJ) -o $@ $(LDFLAGS)
+# backend_xdna.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/backend_xdna_lane.o: backend_xdna.c .build-config
+	$(CC) $(CFLAGS) -DCOLI_XDNA -c backend_xdna.c -o $@
+tests/test_xdna_prepared_state$(EXE): tests/test_xdna_prepared_state.c backend_xdna.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_xdna_registry$(EXE): tests/test_xdna_registry.c backend_xdna.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Synthetic ABI-2 helpers for the execution tests. Plain C, no XRT, no device:
+# they let the whole execution control flow be qualified on a machine with no
+# NPU. Three variants so the all-or-nothing binding contract is testable.
+XDNA_FAKE_HELPERS = tests/xdna_fake_helper.dll \
+                    tests/xdna_fake_helper_abi1.dll \
+                    tests/xdna_fake_helper_partial.dll
+tests/xdna_fake_helper.dll: tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -shared $< -o $@
+tests/xdna_fake_helper_abi1.dll: tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -DFAKE_ABI1 -shared $< -o $@
+tests/xdna_fake_helper_partial.dll: tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -DFAKE_PARTIAL -shared $< -o $@
+
+tests/test_xdna_execution$(EXE): tests/test_xdna_execution.c backend_xdna.c $(XDNA_FAKE_HELPERS)
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Failure/fallback owner. Needs BOTH the engine (matmul_qt is the fallback
+# target it verifies against) and the synthetic ABI-2 helpers, which is why it
+# is a separate owner from test_xdna_execution.
+tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c tests/backend_xdna_lane.o $(XDNA_FAKE_HELPERS) $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< tests/backend_xdna_lane.o $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# NOT a test gate -- intentionally absent from TEST_BINS (its name does not match
+# the tests/test_*$(EXE) pattern the gate list is derived from). It needs a real
+# XDNA2 NPU, a working XRT, a built coli_xdna.dll and the qualified artifact
+# bytes, none of which a build machine may assume. Build and run it explicitly:
+#   make tests/xdna_physical_probe$(EXE)
+#   tests/xdna_physical_probe <artifact-root> <path-to-coli_xdna.dll> [M-list]
+#
+# M-list defaults to 1,32,64 (the M64 bucket); pass 65,130,256 to qualify
+# the M256 bucket through the same owner.
+tests/xdna_physical_probe$(EXE): tests/xdna_physical_probe.c colibri.c tests/backend_xdna_lane.o $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< tests/backend_xdna_lane.o $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_json$(EXE): tests/test_json.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_tok_o200k$(EXE): tests/test_tok_o200k.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_tok_gpt2$(EXE): tests/test_tok_gpt2.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_tok_deepseek$(EXE): tests/test_tok_deepseek.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_k3_ram_budget$(EXE): tests/test_k3_ram_budget.c kimi_k3.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_k3_mmap$(EXE): tests/test_k3_mmap.c kimi_k3.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_tok_kimi_tiny$(EXE): tests/test_tok_kimi_tiny.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_st_pread$(EXE): tests/test_st_pread.c
+	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)
+
+tests/test_st_slice$(EXE): tests/test_st_slice.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c qwen38.c tests/edge_runtime_nocuda.o $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< tests/edge_runtime_nocuda.o $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+# edge_runtime.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/edge_runtime_nocuda.o: edge_runtime.c .build-config
+	$(CC) $(NOCUDA_CFLAGS) -c edge_runtime.c -o $@
+
+tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_dsv41_serve_budget$(EXE): tests/test_dsv41_serve_budget.c deepseek_v41.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_dsv41_untrusted_load$(EXE): tests/test_dsv41_untrusted_load.c deepseek_v41.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# The int4-g64 expert matmul with no model (part of test-c); given a converted
+# snapshot on argv it checks the sidecar's loaders too (qwen38-tiny-int4-check).
+tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_vision$(EXE): tests/test_qwen38_vision.c
+	$(CC) $(CFLAGS) -Wno-unused-function $< -o $@ $(LDFLAGS)
+
+# Genera la fixture della torre e la confronta con l'oracolo upstream. Non serve
+# il checkpoint: 240k parametri casuali, meno di un megabyte.
+.PHONY: qwen38-vision-check
+qwen38-vision-check: tests/test_qwen38_vision$(EXE)
+	$(PYTHON) tools/make_qwen38_vision_tiny.py --out ./qwen38_vision_tiny
+	./tests/test_qwen38_vision$(EXE) ./qwen38_vision_tiny
+
+# Qwen-Image-2.1 VAE decoder against diffusers. The fixture needs torch and
+# diffusers (tools/make_qwenimage_vae_tiny.py OUTDIR, about 6 MB); the test itself
+# is plain C: make test_qwenimage_vae && tests/test_qwenimage_vae OUTDIR
+tests/test_qwenimage_vae$(EXE): tests/test_qwenimage_vae.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+.PHONY: test_qwenimage_vae
+test_qwenimage_vae: tests/test_qwenimage_vae$(EXE)
+
+# Il percorso completo: frame IMAGE, torre, sostituzione degli embedding,
+# generazione. Prova che due immagini diverse danno risposte diverse, che e'
+# l'unica domanda a cui una fixture con pesi casuali sa rispondere onestamente.
+.PHONY: qwen38-vision-serve-check
+qwen38-vision-serve-check: qwen38$(EXE)
+	$(PYTHON) tools/make_qwen38_multimodal_tiny.py --out ./qwen38_mm_tiny
+	$(PYTHON) tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_mm_tiny
+	$(PYTHON) tests/test_qwen38_vision_serve.py --binary ./qwen38$(EXE) --fixture ./qwen38_mm_tiny
+
+tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c qwen38.c tests/segment_runtime_nocuda.o $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< tests/segment_runtime_nocuda.o $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+# segment_runtime.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/segment_runtime_nocuda.o: segment_runtime.c .build-config
+	$(CC) $(NOCUDA_CFLAGS) -c segment_runtime.c -o $@
+
+tests/test_st_map$(EXE): tests/test_st_map.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_dup_name_refusal$(EXE): tests/test_dup_name_refusal.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_st_shape$(EXE): tests/test_st_shape.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Exhaustive bit-exact gate for st.h's bf16_to_f32_bulk/f16_to_f32_bulk AVX2 tier
+# (all 65536 patterns per format -- see the file for why no tolerance applies).
+tests/test_st_f16_bf16_simd$(EXE): tests/test_st_f16_bf16_simd.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
+# so the SSE4.1 body in st.h is actually exercised even on a devbox that
+# would otherwise always pick the AVX2 tier.
+tests/test_st_f16_bf16_simd_sse41$(EXE): tests/test_st_f16_bf16_simd.c
+	$(CC) $(CFLAGS) -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
+
+# bf16_to_f32_bulk/f16_to_f32_bulk vs the scalar per-element reference, NOT a
+# test gate. Build on demand: make tests/bench_st_f16_bf16_simd ARCH=native
+tests/bench_st_f16_bf16_simd$(EXE): tests/bench_st_f16_bf16_simd.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Synthetic peak-RSS proxy for qwen36.c's dense-int8-during-load change
+# (load_tq vs the old post-hoc qdw_register pass), NOT a test gate. Build on
+# demand: make tests/bench_load_tq_peak_rss
+tests/bench_load_tq_peak_rss$(EXE): tests/bench_load_tq_peak_rss.c
+	$(CC) -O3 -march=native $< -o $@ -lm
+
+tests/test_st$(EXE): tests/test_st.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_st_mirror$(EXE): tests/test_st_mirror.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_st_overlay$(EXE): tests/test_st_overlay.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_compat_mem$(EXE): tests/test_compat_mem.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_st_missing$(EXE): tests/test_st_missing.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_st_range_rep$(EXE): tests/test_st_range_rep.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_tier$(EXE): tests/test_tier.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_grammar$(EXE): tests/test_grammar.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_own_file$(EXE): tests/test_own_file.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# RoPE inv_freq precompute must stay byte-identical to the old powf-per-position
+# path; drives the real rope_interleave (includes colibri.c) vs a reference.
+# -ffp-contract=off: the in-test reference is a DIFFERENT loop body than the
+# shipping one, and on FMA targets (x86-64-v3, where -ffp-contract=fast is the
+# default) the compiler contracts the two bodies differently — a*cs-b*sn then
+# rounds differently between reference and real function even for pre-change
+# code, a harness artifact rather than an engine regression. Engine-level
+# equivalence under the shipping flags is covered by the differential dump
+# (old vs new rope_interleave are byte-identical); this test guards the
+# source-level formula equivalence and must not depend on contraction luck.
+tests/test_rope_invfreq$(EXE): tests/test_rope_invfreq.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -ffp-contract=off $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# schema->GBNF compile cache (#7): grammar_reset must equal a fresh setup, and
+# the GrDraft.src ownership must not leak/double-free. Includes colibri.c.
+tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# The classified logit-row reduction in sample.h and the digest in
+# evidence_digest.h: no model/weights, published SHA-256 vectors, an
+# agreement check against the plain logprob_target the sampling path uses
+# on rows a float subtraction cannot mis-round, and a double-precision
+# check against a second double computation on rows that do.
+tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# The ablation mode's manifest loader, evidence writer and dispatch contract.
+# The adapter build bypasses only the model computation, so the parser/writer
+# path is exercised for real with no model and no weights.
+tests/test_ablate_mode$(EXE): tests/test_ablate_mode.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# Standalone: drives a faithful miniature of moe()'s routing+accumulate and links
+# the SAME abl.h the engine links -- no model/weights needed (the ablation-logic gate).
+tests/test_ablate$(EXE): tests/test_ablate.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Standalone: exercises the DEGRADE_ZERO miss-slot zero-fill logic extracted from
+# moe() -- no model/weights needed (issue #865).
+tests/test_degrade_zero$(EXE): tests/test_degrade_zero.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_schema_gbnf$(EXE): tests/test_schema_gbnf.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_spec_decode_state$(EXE): tests/test_spec_decode_state.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_decode_batch$(EXE): tests/test_decode_batch.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_pin_pool$(EXE): tests/test_pin_pool.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_serve_codec$(EXE): tests/test_serve_codec.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_serve_budget$(EXE): tests/test_serve_budget.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_segment_runtime$(EXE): tests/test_segment_runtime.c tests/segment_runtime.o
+	$(CC) $(CFLAGS) tests/test_segment_runtime.c tests/segment_runtime.o -o $@ $(LDFLAGS)
+# segment_runtime.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/segment_runtime.o: segment_runtime.c .build-config
+	$(CC) $(CFLAGS) -c segment_runtime.c -o $@
+
+tests/test_segment_conformance$(EXE): tests/test_segment_conformance.c tests/segment_conformance_fixtures.o tests/segment_runtime.o
+	$(CC) $(CFLAGS) tests/test_segment_conformance.c tests/segment_conformance_fixtures.o tests/segment_runtime.o -o $@ $(LDFLAGS)
+# tests/segment_conformance_fixtures.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/segment_conformance_fixtures.o: tests/segment_conformance_fixtures.c .build-config
+	$(CC) $(CFLAGS) -c tests/segment_conformance_fixtures.c -o $@
+
+tests/test_inkling_serve_framing$(EXE): tests/test_inkling_serve_framing.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_inkling_shared_batch$(EXE): tests/test_inkling_shared_batch.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# Reproducible local A/B for the shared-expert prefill path.  This is timing
+# evidence, not a CI gate: build and run it explicitly on the target CPU.
+tests/bench_inkling_shared_batch$(EXE): tests/bench_inkling_shared_batch.c inkling.c \
+		$(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_inkling_cache_index$(EXE): tests/test_inkling_cache_index.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_kimi_serve_framing$(EXE): tests/test_kimi_serve_framing.c kimi_k3.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_kimi_cache_index$(EXE): tests/test_kimi_cache_index.c kimi_k3.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_k3_chat_tools$(EXE): tests/test_k3_chat_tools.c kimi_k3.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# olmoe's matmul_q, not colibri's: compares the IDOT path against FP32
+# ACTIVATIONS rather than an integer reference. NOCUDA_* for the same reason
+# the olmoe target uses it -- olmoe.c contains no COLI_CUDA code.
+tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_olmoe_moe_by_expert$(EXE): tests/test_olmoe_moe_by_expert.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+tests/test_idot$(EXE): tests/test_idot.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_HAVE_GROUPED_PAIR $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# Force the grouped-int4 oracle onto the SSE4.1 tier even on an AVX2 host.
+tests/test_i4_grouped_sse41$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -O3 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_i4_grouped_sse41_o1$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -O1 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_i4_grouped_sse41_no_contract$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -O3 -ffp-contract=off -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_stops$(EXE): tests/test_stops.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_cfg_topk$(EXE): tests/test_cfg_topk.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_topp$(EXE): tests/test_topp.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
+# gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
+tests/bench_topp$(EXE): tests/bench_topp.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_temp_env$(EXE): tests/test_temp_env.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_kv_fp8$(EXE): tests/test_kv_fp8.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_kv_tq$(EXE): tests/test_kv_tq.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_kv_disk$(EXE): tests/test_kv_disk.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# fmt=6 kernel oracle: needs the generated grid table, and its fixture comes from
+# the reference codec (tools/make_e8_fixture.py) — regenerate if the layout moves.
+tests/test_e8_kernel$(EXE): tests/test_e8_kernel.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_e4m3_vector$(EXE): tests/test_e4m3_vector.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_stop_ids$(EXE): tests/test_stop_ids.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_sparse_attn$(EXE): tests/test_sparse_attn.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_expert_ffn$(EXE): tests/test_expert_ffn.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# The Vulkan weight pool's offset allocator (vk_alloc.h): bookkeeping only, no
+# device, so it is an ordinary gate.
+tests/test_vk_alloc$(EXE): tests/test_vk_alloc.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# The Vulkan routed-expert tier (vk_tier.c) against a CPU reference: every source
+# format, warm start, eviction, partial batches. It needs VK=1 and a Vulkan device
+# (CI: Lavapipe), so it stays out of `check` (TEST_EXCLUDE) and runs from
+# vk-tier-check.
+tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_tier needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+.PHONY: vk-tier-check
+vk-tier-check: tests/test_vk_tier$(EXE)
+	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
+
+# The dense chain's ops (vk_chain.c, shaders/chain_*.comp) against CPU references, on
+# a Vulkan device (CI: Lavapipe); like test_vk_tier it needs VK=1 and stays out of
+# `check`.
+tests/test_vk_chain$(EXE): tests/test_vk_chain.c $(VK_OBJ) $(VK_SPV)
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_chain needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+.PHONY: vk-chain-check
+vk-chain-check: tests/test_vk_chain$(EXE)
+	./tests/test_vk_chain$(EXE) shaders/qmatmul.spv
+
+# GLM-5.3's resident f32 dispatch and its dense memory reservation (#1863).
+# Run by vulkan_engines.sh shader; requires a real or software Vulkan device.
+tests/test_glm53_vk_f32$(EXE): tests/test_glm53_vk_f32.c glm53.c $(VK_OBJ) $(VK_SPV)
+	@[ "$(VK)" = 1 ] || { echo "tests/test_glm53_vk_f32 needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_rans$(EXE): tests/test_rans.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Structured-mutation fuzz for the rans record parser/decoder under
+# ASan+UBSan — seeded and bounded (a few thousand mutants, well under a
+# minute), asserting no sanitizer report and byte identity across every
+# compiled decode arm on every accepted record. NOT a test gate (sanitizer
+# flags differ from the normal build); build+run on demand:
+#   make fuzz-rans
+fuzz-rans: tests/fuzz_rans.c rans.h
+	$(CC) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+	  tests/fuzz_rans.c -o tests/fuzz_rans -lm
+	./tests/fuzz_rans
+
+tests/test_int3$(EXE): tests/test_int3.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_int3_load$(EXE): tests/test_int3_load.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_fp8_passthrough$(EXE): tests/test_fp8_passthrough.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Host-only: backend_cuda.h's format predicate is plain C, so its truth table is
+# a portable gate even where there is no CUDA toolchain. Same arrangement as
+# metal_fused_fmt_ok's CPU-testable truth table.
+tests/test_cuda_fmt_guard$(EXE): tests/test_cuda_fmt_guard.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# The fmt=8 LUT-gate state machine. Like test_cuda_fmt_guard it links no CUDA
+# object and needs no toolchain: the two decisions live as pure predicates in
+# backend_cuda.h and backend_cuda.cu calls them, so this pins the engine's own
+# logic on a plain CPU build.
+tests/test_cuda_lut_gate$(EXE): tests/test_cuda_lut_gate.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_fp8_load$(EXE): tests/test_fp8_load.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_qt_addrow$(EXE): tests/test_qt_addrow.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_logit_nan$(EXE): tests/test_logit_nan.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_router_nan$(EXE): tests/test_router_nan.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_compat_direct$(EXE): tests/test_compat_direct.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_compat_prefetch$(EXE): tests/test_compat_prefetch.c $(if $(IS_WIN),tests/compat_prefetch_module.dll)
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/compat_prefetch_module.dll: tests/compat_prefetch_module.c
+	$(CC) $(CFLAGS) -shared $< -o $@ $(LDFLAGS)
+
+tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_native_quant$(EXE): tests/test_native_quant.c tests/deepseek_v4_native_quant.o
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT tests/deepseek_v4_native_quant.o $< -o $@ $(LDFLAGS)
+# deepseek_v4.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/deepseek_v4_native_quant.o: deepseek_v4.c .build-config
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o $@
+
+# Portable MLX affine Q4/Q8 format contract and CPU oracle.  This stays
+# separate from QT fmt=4, whose signed-int4 scale-only layout is incompatible.
+tests/test_affine_quant$(EXE): tests/test_affine_quant.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qpack$(EXE): tests/test_qpack.c tests/qpack.o
+	$(CC) $(CFLAGS) tests/test_qpack.c tests/qpack.o -o $@ $(LDFLAGS)
+# qpack.c as its own object, compiled with the flags this test gave it on the
+# same command line before (#1741): one unit per command keeps each .d whole.
+tests/qpack.o: qpack.c .build-config
+	$(CC) $(CFLAGS) -c qpack.c -o $@
+
+# Loader-side expansion oracle for the same MLX affine contract: nibble/byte
+# order, scalar decodings, parity against coli_affine_matmul_ref, refusals.
+tests/test_affine_dequant$(EXE): tests/test_affine_dequant.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_edge_runtime$(EXE): tests/test_edge_runtime.c tests/edge_runtime.o
+	$(CC) $(CFLAGS) tests/test_edge_runtime.c tests/edge_runtime.o -o $@ $(LDFLAGS)
+# edge_runtime.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/edge_runtime.o: edge_runtime.c .build-config
+	$(CC) $(CFLAGS) -c edge_runtime.c -o $@
+
+ifeq ($(COLI_V4_SUPPORTED),1)
+include Makefile.deepseek-v4.units
+
+# Real engine-owned Segment adapters. These are CPU-baseline embedding
+# objects: ordinary Colibri executables do not link them, and GPU capability
+# is advertised only after an adapter has a real backend implementation.
+SEGMENT_BUILD_DIR = build/segment
+SEGMENT_CPU_CFLAGS = $(filter-out -DCOLI_CUDA -DCOLI_ANS -DCOLI_METAL \
+	-DCOLI_VULKAN,$(CFLAGS)) -include pthread.h \
+	-DCOLI_SEGMENT_ADAPTER -DCOLI_EDGE_ADAPTER
+SEGMENT_ENGINE_OBJS = \
+	$(SEGMENT_BUILD_DIR)/glm.o \
+	$(SEGMENT_BUILD_DIR)/glm53.o \
+	$(SEGMENT_BUILD_DIR)/inkling.o \
+	$(SEGMENT_BUILD_DIR)/kimi.o \
+	$(SEGMENT_BUILD_DIR)/olmoe.o \
+	$(SEGMENT_BUILD_DIR)/qwen36.o \
+	$(SEGMENT_BUILD_DIR)/qwen38.o
+SEGMENT_V4_UNITS = $(filter-out COLI_V4_UNIT_PROMPT \
+	COLI_V4_UNIT_GENERATE_STATS,$(V4_TARGET_UNITS)) $(V4_SEGMENT_UNIT)
+SEGMENT_V4_OBJS = $(addprefix $(SEGMENT_BUILD_DIR)/,$(addsuffix .o,$(SEGMENT_V4_UNITS)))
+SEGMENT_V4_REGISTRY_OBJ = $(SEGMENT_BUILD_DIR)/expert_store_registry.o
+SEGMENT_ALL_OBJS = $(SEGMENT_ENGINE_OBJS) $(SEGMENT_V4_OBJS) \
+	$(SEGMENT_V4_REGISTRY_OBJ)
+SEGMENT_RUNTIME_OBJS = \
+	$(SEGMENT_BUILD_DIR)/segment_runtime.o \
+	$(SEGMENT_BUILD_DIR)/edge_runtime.o
+SEGMENT_RUNTIME_LIB = $(SEGMENT_BUILD_DIR)/libcolibri_segment_edge.a
+
+$(SEGMENT_BUILD_DIR):
+	mkdir -p $@
+
+$(SEGMENT_BUILD_DIR)/glm.o: colibri.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DCOLIBRI_NO_MAIN -c colibri.c -o $@
+
+$(SEGMENT_BUILD_DIR)/glm53.o: glm53.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DGLM53_NO_MAIN -c glm53.c -o $@
+
+$(SEGMENT_BUILD_DIR)/inkling.o: inkling.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DINKLING_NO_MAIN -c inkling.c -o $@
+
+$(SEGMENT_BUILD_DIR)/kimi.o: kimi_k3.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DKIMI_K3_NO_MAIN -c kimi_k3.c -o $@
+
+$(SEGMENT_BUILD_DIR)/olmoe.o: olmoe.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DOLMOE_NO_MAIN -c olmoe.c -o $@
+
+$(SEGMENT_BUILD_DIR)/qwen36.o: qwen36.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN36_NO_MAIN -c qwen36.c -o $@
+
+$(SEGMENT_BUILD_DIR)/qwen38.o: qwen38.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN38_NO_MAIN -c qwen38.c -o $@
+
+$(SEGMENT_V4_OBJS): $(SEGMENT_BUILD_DIR)/%.o: deepseek_v4.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -D$* -c deepseek_v4.c -o $@
+
+$(SEGMENT_V4_REGISTRY_OBJ): expert_store_registry.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -c expert_store_registry.c -o $@
+
+$(SEGMENT_BUILD_DIR)/segment_runtime.o: segment_runtime.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -c segment_runtime.c -o $@
+
+$(SEGMENT_BUILD_DIR)/edge_runtime.o: edge_runtime.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -c edge_runtime.c -o $@
+
+$(SEGMENT_RUNTIME_LIB): $(SEGMENT_RUNTIME_OBJS) $(SEGMENT_ALL_OBJS)
+	$(AR) rcs $@ $^
+
+.PHONY: segment-edge-library
+segment-edge-library: $(SEGMENT_RUNTIME_LIB)
+
+tests/test_segment_adapters_registration$(EXE): \
+		tests/test_segment_adapters_registration.c segment_runtime.c \
+		edge_runtime.c segment_runtime.h edge_runtime.h segment_adapters.h \
+		edge_adapters.h $(SEGMENT_ALL_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_segment_adapters_registration.c \
+		segment_runtime.c edge_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_segment_adapters_real$(EXE): tests/test_segment_adapters_real.c \
+		segment_runtime.c edge_runtime.c segment_runtime.h edge_runtime.h \
+		segment_adapters.h edge_adapters.h $(SEGMENT_ALL_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_segment_adapters_real.c \
+		segment_runtime.c edge_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_edge_adapters_registration$(EXE): \
+		tests/test_edge_adapters_registration.c edge_runtime.c segment_runtime.c \
+		edge_runtime.h segment_runtime.h edge_adapters.h $(SEGMENT_ALL_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_edge_adapters_registration.c \
+		edge_runtime.c segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_edge_adapters_real$(EXE): tests/test_edge_adapters_real.c \
+		edge_runtime.c segment_runtime.c edge_runtime.h segment_runtime.h \
+		edge_adapters.h segment_adapters.h json.h $(SEGMENT_ALL_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_edge_adapters_real.c \
+		edge_runtime.c segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
+.PHONY: segment-adapters segment-adapters-real
+segment-adapters: tests/test_segment_adapters_registration$(EXE)
+	./tests/test_segment_adapters_registration$(EXE)
+
+.PHONY: edge-adapters edge-adapters-real
+edge-adapters: tests/test_edge_adapters_registration$(EXE)
+	./tests/test_edge_adapters_registration$(EXE)
+
+# Maintainer/release gate. Paths point at generated/converted tiny Colibri
+# containers; see docs/segment-runtime.md for the exact generators.
+# OMP_NUM_THREADS defaults to a stable, non-single-threaded 2 for reproducible
+# reductions, but callers can override it to exercise a different schedule.
+# Kimi's generated fixture is safe at a few MB; overcommit there only prevents
+# its production-size reserve heuristic from making the test host-dependent.
+segment-adapters-real: tests/test_segment_adapters_real$(EXE)
+	@test -n "$(GLM_SEGMENT_MODEL)" || { echo "set GLM_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(GLM53_SEGMENT_MODEL)" || { echo "set GLM53_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(INKLING_SEGMENT_MODEL)" || { echo "set INKLING_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(KIMI_SEGMENT_MODEL)" || { echo "set KIMI_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(OLMOE_SEGMENT_MODEL)" || { echo "set OLMOE_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(QWEN_SEGMENT_MODEL)" || { echo "set QWEN_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(QWEN38_SEGMENT_MODEL)" || { echo "set QWEN38_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(DEEPSEEK_SEGMENT_MODEL)" || { echo "set DEEPSEEK_SEGMENT_MODEL" >&2; exit 2; }
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) glm "$(GLM_SEGMENT_MODEL)" 0 3 5 8
+	GLM53_BITS=32 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) glm53 "$(GLM53_SEGMENT_MODEL)" 0 2 4 16
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) inkling "$(INKLING_SEGMENT_MODEL)" 0 4 8 8
+	COLI_RAM_OVERCOMMIT=1 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) kimi "$(KIMI_SEGMENT_MODEL)" 0 3 6 8
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) olmoe "$(OLMOE_SEGMENT_MODEL)" 0 2 4 8
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) qwen36 "$(QWEN_SEGMENT_MODEL)" 0 4 8 8
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) qwen38 "$(QWEN38_SEGMENT_MODEL)" 0 2 4 8
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) qwen38 "$(QWEN38_SEGMENT_MODEL)" 1 2 4 8
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) deepseek_v4 "$(DEEPSEEK_SEGMENT_MODEL)" 0 1 3 8
+
+# End-to-end model-edge gate. Every run performs tokenizer round-trip, embeds
+# the independent oracle's prompt, executes the complete real Segment stack
+# and compares greedy decode tokens with that oracle. The fixture tokenizer
+# helper is only for existing math-only tiny checkpoints that omit one.
+edge-adapters-real: tests/test_edge_adapters_real$(EXE)
+	@test -n "$(GLM_EDGE_MODEL)" && test -n "$(GLM_EDGE_REF)" || { echo "set GLM_EDGE_MODEL and GLM_EDGE_REF" >&2; exit 2; }
+	@test -n "$(GLM53_EDGE_MODEL)" && test -n "$(GLM53_EDGE_REF)" || { echo "set GLM53_EDGE_MODEL and GLM53_EDGE_REF" >&2; exit 2; }
+	@test -n "$(INKLING_EDGE_MODEL)" && test -n "$(INKLING_EDGE_REF)" || { echo "set INKLING_EDGE_MODEL and INKLING_EDGE_REF" >&2; exit 2; }
+	@test -n "$(KIMI_EDGE_MODEL)" && test -n "$(KIMI_EDGE_REF)" || { echo "set KIMI_EDGE_MODEL and KIMI_EDGE_REF" >&2; exit 2; }
+	@test -n "$(OLMOE_EDGE_MODEL)" && test -n "$(OLMOE_EDGE_REF)" || { echo "set OLMOE_EDGE_MODEL and OLMOE_EDGE_REF" >&2; exit 2; }
+	@test -n "$(QWEN_EDGE_MODEL)" && test -n "$(QWEN_EDGE_REF)" || { echo "set QWEN_EDGE_MODEL and QWEN_EDGE_REF" >&2; exit 2; }
+	@test -n "$(QWEN38_EDGE_MODEL)" && test -n "$(QWEN38_EDGE_REF)" || { echo "set QWEN38_EDGE_MODEL and QWEN38_EDGE_REF" >&2; exit 2; }
+	@test -n "$(DEEPSEEK_EDGE_MODEL)" && test -n "$(DEEPSEEK_EDGE_REF)" || { echo "set DEEPSEEK_EDGE_MODEL and DEEPSEEK_EDGE_REF" >&2; exit 2; }
+	GLM_SEGMENT_EBITS=16 GLM_SEGMENT_DBITS=16 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) glm "$(GLM_EDGE_MODEL)" "$(GLM_EDGE_REF)" 3
+	GLM53_BITS=32 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) glm53 "$(GLM53_EDGE_MODEL)" "$(GLM53_EDGE_REF)" 3
+	INK_SEGMENT_BITS=0 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) inkling "$(INKLING_EDGE_MODEL)" "$(INKLING_EDGE_REF)" 3
+	COLI_RAM_OVERCOMMIT=1 K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) kimi "$(KIMI_EDGE_MODEL)" "$(KIMI_EDGE_REF)" 3
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) olmoe "$(OLMOE_EDGE_MODEL)" "$(OLMOE_EDGE_REF)" 3
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) qwen36 "$(QWEN_EDGE_MODEL)" "$(QWEN_EDGE_REF)" 3
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) qwen38 "$(QWEN38_EDGE_MODEL)" "$(QWEN38_EDGE_REF)" 3
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) deepseek_v4 "$(DEEPSEEK_EDGE_MODEL)" "$(DEEPSEEK_EDGE_REF)" 3
+
+V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
+V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
+V4_TEST_LINK_OBJS = \
+	COLI_V4_UNIT_ST.o \
+	COLI_V4_UNIT_CONFIG.o \
+	COLI_V4_UNIT_MATH.o \
+	COLI_V4_UNIT_SPARSE_ATTENTION.o \
+	COLI_V4_UNIT_RESOURCE_PLAN.o \
+	COLI_V4_UNIT_PROMPT.o \
+	$(filter-out COLI_V4_UNIT_EXPERT_STORE.o COLI_V4_UNIT_EXPERT.o,$(addsuffix .o,$(V4_TEST_UNITS))) \
+	$(V4_HOT_TEST_OBJ) \
+	$(V4_BATCH_TEST_OBJ) \
+	COLI_V4_UNIT_EXPERT_ROWS16.o \
+	COLI_V4_UNIT_NATIVE_QUANT.o \
+	COLI_V4_UNIT_NATIVE_QUANT_DUAL.o \
+	COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o
+# Windows engine objects are compiled with -DCOLI_V4_GPU_TIER (the CUDA tier
+# is resolved from coli_cuda_dsv4*.dll at runtime), so the matvec references in
+# native_quant.h resolve through the GPU unit + the DLL loader. Both are inert
+# without a DLL next to the test binary.
+ifneq ($(IS_WIN),)
+V4_TEST_LINK_OBJS += COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
+V4_TEST_EXTRA_TARGETS = COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
+endif
+
+tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c sse41_kernels.h deepseek_v4.c deepseek_v4.h compat.h \
+		Makefile.deepseek-v4.units Makefile.deepseek-v4
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
+		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
+		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
+		COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
+		COLI_V4_UNIT_EXPERT_ROWS16.o \
+		$(V4_HOT_TEST_OBJ) \
+		$(V4_BATCH_TEST_OBJ) \
+		$(V4_TEST_EXTRA_TARGETS)
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(V4_TEST_LINK_OBJS) \
+		-o $@ -pthread $(LDFLAGS)
+
+V4_OWN_DIR = build/ownership
+V4_OWN_CFLAGS = $(CFLAGS) -DCOLI_V4_TEST_HOOKS
+V4_OWNERSHIP_OBJS = \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o \
+	$(V4_OWN_DIR)/expert_store_registry.o
+
+$(V4_OWN_DIR):
+	mkdir -p $(V4_OWN_DIR)
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o: deepseek_v4.c | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_RUNTIME -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o: deepseek_v4.c | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_CONFIG -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o: deepseek_v4.c | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_ST -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o: deepseek_v4.c | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o $@
+
+# The engine (RUNTIME unit) opens its expert store through the pluggable
+# backend registry, so any test linking RUNTIME also links the registry object
+# (which defines coli_expert_store_backend_open_selected + registers "auto").
+$(V4_OWN_DIR)/expert_store_registry.o: expert_store_registry.c | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -c expert_store_registry.c -o $@
+
+tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
+	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
+
+tests/test_v4_serve_framing$(EXE): tests/test_v4_serve_framing.c sse41_kernels.h deepseek_v4.c \
+		deepseek_v4.h deepseek_v4_internal.h serve_codec.h Makefile.deepseek-v4 Makefile.deepseek-v4.units
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $@
+
+endif
+
+tests/test_route_trace$(EXE): tests/test_route_trace.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_cli_args$(EXE): tests/test_cli_args.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_oracle$(EXE): tests/test_oracle.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Il tier CUDA con un backend finto: gira SENZA GPU perche' il test definisce i
+# coli_cuda_* e registra cosa riceve. E' il solo modo di provare in CI che un
+# esperto arriva davvero in VRAM e nel formato giusto (#1331) -- un test che si
+# fermasse a "qt_init ritorna 1" sarebbe passato anche col difetto.
+tests/test_qwen36_tier_int8$(EXE): tests/test_qwen36_tier_int8.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend (tests/qwen36_fake_cuda.h), two devices: proves the tier's
+# per-device input-replica block (G.is_x) is sized and strided so device 1's
+# block cannot run past the end of the buffer or into device 0's (#1339).
+tests/test_qwen36_tier_multidev$(EXE): tests/test_qwen36_tier_multidev.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Budget separate gate/up/down scale allocations at their own size classes.
+tests/test_qwen36_tier_scale_budget$(EXE): tests/test_qwen36_tier_scale_budget.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend, single device: proves qt_shutdown returns (under an
+# alarm(10) watchdog) instead of hanging forever when a group is still open
+# and an LFRU swap is parked waiting for cv_take (#1340).
+tests/test_qwen36_tier_shutdown$(EXE): tests/test_qwen36_tier_shutdown.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Release owned projections and experts before CUDA teardown, then reopen safely.
+tests/test_qwen36_tier_release$(EXE): tests/test_qwen36_tier_release.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend, but driving the ENGINE: the warmstart in qwen36.c hands the
+# tier raw pointers into the RAM expert slots, so only a test that includes
+# qwen36.c can prove the weights behind them are still there afterwards -- on an
+# int8 container there is no packed copy to rebuild them from (#1341). Includes
+# qwen36_tier.c in its own TU like the other tier tests, so nothing else is
+# compiled in and no model file is needed.
+# Same fake backend, the RULES the three regression tests above are instances
+# of: budget accounting balances on every device (reservations are consumed or
+# returned, never leaked), shutdown wakes all four cv_take waiters at once, and
+# issue blocks stay inside, disjoint and at their device's slot under random
+# routing on 1-3 devices. Under test-asan the third doubles as a fuzz for the
+# #1339 class.
+tests/test_qwen36_tier_invariants$(EXE): tests/test_qwen36_tier_invariants.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Async collection errors must drain all devices and reject partial output.
+tests/test_qwen36_tier_take_error$(EXE): tests/test_qwen36_tier_take_error.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend, with uploads that take time: qt_fill_wait must not return
+# until the last enqueued expert is RESIDENT, not merely dequeued -- the engine
+# frees the RAM int8 copies right after it (#1360 saw the gap one run in
+# fifteen; here the slow upload hook makes it every run without the fix).
+tests/test_qwen36_tier_fill_wait$(EXE): tests/test_qwen36_tier_fill_wait.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend: the automatic placement (COLI_PLACE unset/"auto") puts
+# the offered dense trunk into VRAM by bytes-saved-per-byte, prices displaced
+# experts by heat, keeps the trunk on the CPU when the marginal experts are
+# hotter, honours an explicit list and "off", and takes placed bytes out of
+# the expert budget -- on one and on two devices.
+tests/test_qwen36_tier_autoplace$(EXE): tests/test_qwen36_tier_autoplace.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Failed tier startup must release host storage and initialized synchronization.
+tests/test_qwen36_tier_init_failure$(EXE): tests/test_qwen36_tier_init_failure.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend: the fp8 streaming mode a model whose experts do not fit
+# in RAM needs (Qwen3.8) -- cap < n_experts accepted, fmt=8 uploads with
+# 128x128 block scales, bytes staged unchanged, no pointer kept into the
+# engine's recycled slot, promotion decided when the bytes pass by.
+tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Failed gate/up/down uploads must release every unpublished CUDA tensor.
+tests/test_qwen36_tier_rollback$(EXE): tests/test_qwen36_tier_rollback.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Generic resident dense matrices (the Qwen3.8 trunk) and per-offer placement.
+tests/test_qwen36_tier_dense$(EXE): tests/test_qwen36_tier_dense.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# DeltaNet input projection batching, state parity and block failure fallback.
+tests/test_qwen36_dnproj_batch$(EXE): tests/test_qwen36_dnproj_batch.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# the automatic trunk placement can be withdrawn after the startup probe (fake backend).
+tests/test_qwen36_tier_withdraw$(EXE): tests/test_qwen36_tier_withdraw.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# QT_HOME=layer: expert homes per layer range, the cards as a pipeline (fake backend, two devices).
+tests/test_qwen36_tier_layer_home$(EXE): tests/test_qwen36_tier_layer_home.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# qt_replan: the resident set follows the prompt's own routing counts (fake backend).
+tests/test_qwen36_tier_replan$(EXE): tests/test_qwen36_tier_replan.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# The DeltaNet layer on the GPU (Q36_DN_GPU=1): outputs and state against the CPU path, fake backend.
+tests/test_qwen36_dn_gpu$(EXE): tests/test_qwen36_dn_gpu.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# dnout / attnproj / shexp offered, placed and served from VRAM (fake backend).
+tests/test_qwen36_trunk_dense$(EXE): tests/test_qwen36_trunk_dense.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# #1391: il decode path deve offrire gli esperti int8 al tier, non solo il warmstart
+tests/test_qwen36_tier_int8_decode$(EXE): tests/test_qwen36_tier_int8_decode.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# The qwen38 engine through its own main() on the fake backend: tier start
+# from the FP8 fixture, reduced CPU list, qt_note on recycled slots, oracle
+# tokens unchanged. Needs the fixture (qwen38-tiny-fp8-generate).
+tests/test_qwen38_tier_engine$(EXE): tests/test_qwen38_tier_engine.c qwen38.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# Q38_DN_GPU=1 on the tiny FP8 fixture (fake backend, oracle): runs from qwen38-dn-gpu-check.
+tests/test_qwen38_dn_gpu$(EXE): tests/test_qwen38_dn_gpu.c qwen38.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_serve_poll$(EXE): tests/test_serve_poll.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Linux-only: legge /proc/self/status. La regola c'e' comunque, il test si
+# salta da solo dove /proc non esiste.
+tests/test_rss_anon$(EXE): tests/test_rss_anon.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# #1375: la memoria disponibile e' misurata in compat.h per Linux, macOS e
+# Windows; questo test gira nei tre job e fallisce dove la misura vale 0.
+tests/test_mem_available$(EXE): tests/test_mem_available.c
+	$(CC) $(CFLAGS) tests/test_mem_available.c -o $@ $(LDFLAGS)
+
+tests/test_exact_dot$(EXE): tests/test_exact_dot.c
+	$(CC) $(CFLAGS) tests/test_exact_dot.c -o tests/test_exact_dot$(EXE) $(LDFLAGS)
+
+tests/test_798_guards$(EXE): tests/test_798_guards.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_corpus_draft$(EXE): tests/test_corpus_draft.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_cap_precedence$(EXE): tests/test_cap_precedence.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+tests/test_mirror_stripe_split$(EXE): tests/test_mirror_stripe_split.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+tests/test_v4_hybrid_policy$(EXE): tests/test_v4_hybrid_policy.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_k3_fill_budget$(EXE): tests/test_k3_fill_budget.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_v4_bank_pair$(EXE): tests/test_v4_bank_pair.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_ram_clamp$(EXE): tests/test_ram_clamp.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_cap_mixed_width$(EXE): tests/test_cap_mixed_width.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_eslot_inflight$(EXE): tests/test_eslot_inflight.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_glm_cache_index$(EXE): tests/test_glm_cache_index.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_ssd_probe$(EXE): tests/test_ssd_probe.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# bench_dsa_select is a microbenchmark (old qsort vs new quickselect partial-select, #356),
+# NOT a test gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_dsa_select
+tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# bench_router_select is a microbenchmark (duplicate-prefix scan vs marked-score scan),
+# not a test gate. Build on demand: make tests/bench_router_select.
+tests/bench_router_select$(EXE): tests/bench_router_select.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# bench_indexer_allocations: microbenchmark (DeepSeek V4 indexer malloc vs persistent arena scratch), NOT a test gate.
+# Build on demand: make tests/bench_indexer_allocations
+tests/bench_indexer_allocations$(EXE): tests/bench_indexer_allocations.c
+	$(CC) -O3 $< -o $@
+
+# bench_idot: microbenchmark (single-acc vs independent-acc AVX-VNNI idot), NOT a test gate.
+# Build on demand on an AVX-VNNI CPU: make tests/bench_idot ARCH=native
+tests/bench_idot$(EXE): tests/bench_idot.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# bench_i4p_gidot: microbenchmark (per-row vs multi-row/AMX K1b grouped planar IDOT), NOT a test gate.
+# Build on demand: make tests/bench_i4p_gidot ARCH=native
+tests/bench_i4p_gidot$(EXE): tests/bench_i4p_gidot.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# bench_gemv_stream: microbenchmark (decode-regime GEMV bandwidth vs the read ceiling;
+# frozen-baseline + deinterleaved-x candidate A/B), NOT a test gate.
+# Build on demand: make tests/bench_gemv_stream ARCH=native
+tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# bench_matmul_f32: microbenchmark (pre-#442 scalar vs row-blocked fmaf f32 matmul at
+# router shapes), NOT a test gate. Build on demand: make tests/bench_matmul_f32
+tests/bench_matmul_f32$(EXE): tests/bench_matmul_f32.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_attn_f32: microbenchmark (one decode token's attention core in qwen36,
+# olmoe and inkling, scalar q.k vs matmul_f32.h lanes), NOT a test gate.
+# Build on demand: make tests/bench_attn_f32
+tests/bench_attn_f32$(EXE): tests/bench_attn_f32.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_matmul_f32$(EXE): tests/test_matmul_f32.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_mla_simd: microbenchmark (scalar vs AVX2/NEON MLA-absorb reductions, #442),
+# NOT a test gate. Build on demand: make tests/bench_mla_simd
+tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_uring$(EXE): tests/test_uring.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_pipe_block$(EXE): tests/test_pipe_block.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_pilot_ring$(EXE): tests/test_pilot_ring.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+tests/test_moe_gs_guard$(EXE): tests/test_moe_gs_guard.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_omp_tune$(EXE): tests/test_omp_tune.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_compat_env$(EXE): tests/test_compat_env.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_kvb_notice$(EXE): tests/test_kvb_notice.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# Standalone: proves the group-scaled int8 GEMV keeps every row's float
+# operations in their original order -- the assumption qwen36's byte-identical
+# output rests on. Links the SAME gsgemv.h the engine links.
+tests/test_gsgemv$(EXE): tests/test_gsgemv.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
+# so the SSE4.1 body in gsgemv.h is actually exercised even on a devbox that
+# would otherwise always pick the AVX2 tier.
+tests/test_gsgemv_sse41$(EXE): tests/test_gsgemv.c
+	$(CC) $(CFLAGS) -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
+
+# Standalone: proves the plain (non-group-scaled) int8 GEMV keeps its exact
+# sequence of float operations -- the assumption qwen36's byte-identical
+# output rests on. Links the SAME qgemv.h the engine links.
+tests/test_qgemv$(EXE): tests/test_qgemv.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
+# so the SSE4.1 body in qgemv.h is actually exercised even on a devbox that
+# would otherwise always pick the AVX2 tier.
+tests/test_qgemv_sse41$(EXE): tests/test_qgemv.c
+	$(CC) $(CFLAGS) -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
+
+# olmoe's dot_i8_16 (ARM NEON/AVX2/SSE4.1 variants): must be bit-exact against
+# a scalar int8 reference -- pure integer arithmetic, no tolerance needed.
+# NOCUDA_* for the same reason the other olmoe.c-including test rules use it.
+tests/test_olmoe_dot_i8_16$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
+# so the SSE4.1 body in olmoe.c's dot_i8_16 is actually exercised even on a
+# devbox that would otherwise always pick the AVX2 tier.
+tests/test_olmoe_dot_i8_16_sse41$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# layer_cuda_shard_kvb's format-allowlist refusal (see the test's file header). The
+# function only exists under -DCOLI_CUDA, so on a default (CPU) build the binary is a
+# loud SKIP; built with CUDA=1 it links backend_cuda.o ($(CUDA_OBJ)) and exercises the
+# real guard -- no GPU needed, every probed path returns before any device context.
+tests/test_shard_kvb_refuse$(EXE): tests/test_shard_kvb_refuse.c colibri.c $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+
+# The e8x4g64 container loader harness. It takes a minted directory on argv and
+# is driven by tests/test_e8x4g64_mint_load.py, which builds it too -- this rule
+# exists so it also compiles under the suite's own $(CFLAGS) rather than only
+# under the driver's hand-copied flag list, and so a warning regression in it
+# fails the normal build.
+tests/test_e8x4g64_loader$(EXE): tests/test_e8x4g64_loader.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# Reachable build-only entry point for the harness above: `make check` never
+# calls this (it stays out of TEST_BINS/test-c, per TEST_EXCLUDE), so this adds
+# no time to `check`. It exists so the suite's own $(CFLAGS) and warnings are
+# actually exercised on demand, the way qwen38-tier-engine-check does for
+# test_qwen38_tier_engine below.
+.PHONY: e8x4g64-loader-check
+e8x4g64-loader-check: tests/test_e8x4g64_loader$(EXE)
+
+test-c: $(TEST_BINS)
+	$(PYTHON) tools/run_tests.py $(TEST_BINS)
+
+# test-python builds the rans ctypes bridge first: without it the repack e2e
+# test's C-vs-Python byte-identity pin would silently compare Python against
+# itself (the test ALSO skips loudly if the library is somehow still absent,
+# e.g. when invoked via unittest directly — but a green `make test` must mean
+# the pin was actually checked).
+test-python: $(RANSLIB)
+	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
+
+test: test-c test-python
+
+# --- Efficiency / regression suite (issue: "test the program for inefficiencies") ---
+# The tiny-model assertions live in test_inefficiency.py and run as part of
+# test-python (they're discovered by the test_*.py glob). These targets are
+# convenience entry points; the opt-in full-model report is NEVER in `make test`.
+#
+#   make efficiency        tiny-model asserted regression tests (CPU; part of test-python)
+#   make efficiency-cuda   the CUDA-path tests (requires a CUDA build — see below)
+#   make efficiency-report opt-in full-model 🟢/🔴 diagnostic, never fails CI
+#
+# CUDA build (Windows): the CUDA tests need a host built with -DCOLI_CUDA plus
+# the runtime DLL. Do this FIRST — note CUDA_DLL=1 on BOTH the host and the
+# rule below, or `make glm.exe` will rebuild a CPU-only host and overwrite it:
+#   make clean && make glm.exe CUDA_DLL=1 && make cuda-dll
+# The tests auto-skip with a clear message if the host is CPU-only.
+efficiency: test-python
+	$(PYTHON) -m unittest tests.test_inefficiency -v
+
+efficiency-cuda:
+	$(PYTHON) -m unittest tests.test_inefficiency.TinyCudaEfficiencyTest -v
+
+efficiency-report:
+	$(PYTHON) tests/test_efficiency_report.py
+
+
+# What a parallel region costs before its body runs. Backs the `if(S > 1)`
+# clause in the DSA indexer: at decode that region has one iteration, and the
+# fork/join is paid anyway. Not a gate -- a measurement, run it when changing
+# how the engine parallelises.
+#   make -C c bench-omp-grain
+# Honours OMP_NUM_THREADS/OMP_WAIT_POLICY, so measure with the settings the
+# engine actually runs under (omp_tune.h sizes the team to physical cores).
+bench-omp-grain: tests/bench_omp_grain.c
+	$(CC) $(CFLAGS) $< -o tests/bench_omp_grain $(LDFLAGS)
+	./tests/bench_omp_grain
+
+# --- sanitizers ---------------------------------------------------------
+# The whole C test suite under AddressSanitizer + UndefinedBehaviorSanitizer.
+# Until this target the only sanitized code in the tree was fuzz-rans, which
+# covers rans.h alone -- the engine's 9k lines of pointer arithmetic, mmap/pread
+# and worker threads had never been run under ASan at all.
+#
+# detect_leaks is OFF, deliberately. The engines allocate their tensor index,
+# parsed config and weight slabs once and use them until exit; st.h says as much
+# ("intentionally leaked ... one-time startup parsing"). LeakSanitizer reports
+# every one of those, which would bury the reports that matter -- a
+# heap-buffer-overflow or a use-after-free -- under noise nobody intends to fix.
+# halt_on_error makes the first UB report fail the run instead of scrolling past.
+#
+# -O1: ASan needs frame pointers and readable stacks; -O3 costs signal for speed
+# that a test run does not need.
+ASAN_CFLAGS  = -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
+ASAN_LDFLAGS = -fsanitize=address,undefined
+# detect_stack_use_after_return=0: ASan's fake stack frames are only 32-byte aligned,
+# and on an AVX-512 host (-march=native) GCC keeps 64-byte aligned locals there and
+# stores them with vmovdqa64, which faults (inkling's matmul_w on a Zen 4 runner).
+# Every other check stays on; this file's sanitizer runs and the CI's use the same.
+ASAN_ENV     = ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+
+# `make clean` first is not optional: tools/clean.py had to be fixed to remove
+# Unix test binaries at all (it globbed only *.exe), and without that step this
+# target re-runs binaries built with the NORMAL flags and reports them clean.
+test-asan:
+	@$(MAKE) clean
+	@$(ASAN_ENV) $(MAKE) test-c EXTRA_CFLAGS="$(ASAN_CFLAGS)" EXTRA_LDFLAGS="$(ASAN_LDFLAGS)"
+	@echo "test-asan: suite clean under ASan + UBSan"
+
+# Local validation: one portable CPU build and dependency-free tests.
+check:
+	$(MAKE) clean
+	$(MAKE) portable
+	$(MAKE) test
+
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) laya$(EXE) gliner_decide$(EXE) \
+	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
+	$(INSTALL) -d $(DESTDIR)$(BINDIR)
+	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
+	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
+	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
+	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
+	$(INSTALL) -m 755 glm53$(EXE) $(DESTDIR)$(LIBEXECDIR)/glm53$(EXE)
+	$(INSTALL) -m 755 inkling$(EXE) $(DESTDIR)$(LIBEXECDIR)/inkling$(EXE)
+	$(INSTALL) -m 755 kimi_k3$(EXE) $(DESTDIR)$(LIBEXECDIR)/kimi_k3$(EXE)
+	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
+	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
+	$(INSTALL) -m 755 qwen38$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen38$(EXE)
+	$(INSTALL) -m 755 qwenimage$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwenimage$(EXE)
+	$(INSTALL) -m 755 laya$(EXE) $(DESTDIR)$(LIBEXECDIR)/laya$(EXE)
+	$(INSTALL) -m 755 gliner_decide$(EXE) $(DESTDIR)$(LIBEXECDIR)/gliner_decide$(EXE)
+	$(INSTALL) -m 755 deepseek_v41$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v41$(EXE)
+	$(INSTALL) -m 755 mimo$(EXE) $(DESTDIR)$(LIBEXECDIR)/mimo$(EXE)
+	@if [ -f deepseek_v4$(EXE) ]; then \
+	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
+	fi
+	$(INSTALL) -m 644 family_registry.py resource_plan.py doctor.py autotune.py \
+		openai_server.py cluster.py v4_dsml.py v41_dsml.py version.py \
+		image_engine.py term_image.py setup_flow.py setup_hw.py setup_catalog.py \
+		setup_download.py mcp_server.py $(DESTDIR)$(LIBEXECDIR)/
+	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
+	@# The dashboard is an optional build artifact (cd web && npm run build), so install
+	@# it only when it exists. It goes NEXT TO openai_server.py, which probes ./web/dist.
+	@if [ -f ../web/dist/index.html ]; then \
+	  $(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/web/dist; \
+	  cp -R ../web/dist/. $(DESTDIR)$(LIBEXECDIR)/web/dist/; \
+	  echo "installed the web dashboard"; \
+	else \
+	  echo "web/dist absent -- skipping the dashboard (build it with: cd web && npm run build)"; \
+	fi
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/coli
+	rm -rf $(DESTDIR)$(LIBEXECDIR)
+
+clean:
+	$(PYTHON) tools/clean.py
+
+bench: iobench$(EXE)
+	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
+.PHONY: all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
+	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
+	qwen38-tiny-generate qwen38-tiny-check \
+	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
+	test-c test-python test check clean install uninstall bench
+
+# Own line: see the TEST_RULES note above on shared .PHONY lines.
+.PHONY: bench-omp-grain
+.PHONY: test-asan
+.PHONY: dsv4-cuda-test cuda-dsv4-dll cuda-dsv4-dg-dll dsv4-cuda-loader-test
+
+tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c
+	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
+
+tests/test_glm53_image_key$(EXE): tests/test_glm53_image_key.c
+	$(CC) $(CFLAGS) tests/test_glm53_image_key.c -o tests/test_glm53_image_key$(EXE) $(LDFLAGS)
+
+tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
+
+# Kimi CUDA dispatch/fallback with a fake backend; no CUDA toolkit required.
+tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# ---------------------------------------------------------------------------
+# Generated header prerequisites (#1741)
+#
+# Every rule in AUTODEP_BINS compiles ONE translation unit with $(CFLAGS), so
+# -MMD (added to CFLAGS near the top) leaves a complete <target>.d and the rule
+# does not list headers by hand. The engines and everything under tests/ are
+# derived the same way TEST_RULES is, so a new rule joins automatically; the
+# objects and the ctypes library are named here.
+#
+# A command that compiles several .c files writes a .d for the LAST one only,
+# silently dropping the headers of the others. So a helper source a test links
+# is its own object (the tests/*.o rules, each next to its test), compiled with
+# the flags that test gives it. tests/test_makefile_deps.py fails if a rule in
+# AUTODEP_BINS ever compiles more than one unit.
+#
+# AUTODEP_ELSEWHERE keeps its header lists: test_deepseek_v4 and
+# test_v4_serve_framing are built by Makefile.deepseek-v4, and the four
+# segment/edge adapter tests still compile three units in one command.
+# AUTODEP_OWN_FLAGS does not compile through $(CFLAGS) at all (a GPU compiler,
+# or a benchmark pinned to its own flags), so it writes no .d. The nvcc,
+# MSVC-hosted CUDA, Metal and fuzz targets, and the gcc-built CUDA loader
+# harnesses (dsv4-cuda-*), keep their lists and are not listed here at all.
+#
+# Most rules do not depend on .build-config, so a change to CFLAGS alone would
+# not rebuild a binary made before this change, and it would have no .d. Each
+# target therefore also depends on its own .d through an empty rule: a missing
+# .d counts as out of date, the target is rebuilt, and that compile writes it.
+# The same covers a .d deleted by hand.
+AUTODEP_ELSEWHERE = test_segment_adapters_registration test_segment_adapters_real \
+	test_edge_adapters_registration test_edge_adapters_real test_deepseek_v4 \
+	test_v4_serve_framing
+AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
+	bench_indexer_allocations
+ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
+AUTODEP_TESTS := $(patsubst tests/%,%,$(filter tests/%,$(RULE_NAMES)))
+AUTODEP_OBJS      = backend_vulkan.o vk_tier.o backend_loader.o backend_xdna.o qwen36_tier.o \
+	tests/backend_xdna_lane.o tests/edge_runtime.o tests/edge_runtime_nocuda.o \
+	tests/segment_runtime.o tests/segment_runtime_nocuda.o \
+	tests/segment_conformance_fixtures.o tests/deepseek_v4_native_quant.o \
+	qwen36_qpack.o qpack.o tests/qwen36_qpack.o tests/qpack_qwen36.o tests/qpack.o \
+	$(SEGMENT_ALL_OBJS) $(SEGMENT_RUNTIME_OBJS) $(V4_OWNERSHIP_OBJS) $(RANSLIB)
+AUTODEP_BINS      = $(addsuffix $(EXE),$(ENGINE_RULES)) \
+	$(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(AUTODEP_ELSEWHERE) \
+		$(AUTODEP_OWN_FLAGS),$(AUTODEP_TESTS)))) \
+	$(AUTODEP_OBJS) $(if $(IS_WIN),tests/compat_prefetch_module.dll)
+AUTODEP_DEPS      = $(addsuffix .d,$(basename $(AUTODEP_BINS)))
+$(foreach b,$(AUTODEP_BINS),$(eval $(b): $(basename $(b)).d))
+$(AUTODEP_DEPS): ;
+-include $(wildcard $(AUTODEP_DEPS))

@@ -1,0 +1,1 @@
+gcc|-O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -MMD -MP|-lm -fopenmp -pthread |CUDA=0|CUDA_DLL=0|ARCH=native|CUDA_ARCH=native|METAL=0|HIP=0|HIP_DLL=0|HIP_ARCH=native|VK=0|XDNA=0

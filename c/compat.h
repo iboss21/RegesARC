@@ -1,0 +1,688 @@
+/* compat.h — shim di portabilita' per piattaforme non-Linux (oggi: macOS / Apple Silicon,
+ * Windows 11 x86-64 via MinGW-w64).
+ * Regola: ogni differenza di piattaforma vive QUI; i .c restano puliti.
+ *
+ * Storicamente su Linux questo header era un NO-OP totale (solo shim per le altre
+ * piattaforme). Non lo e' piu': coli_stdin_readable() definisce anche il ramo POSIX,
+ * perche' un helper *portabile* deve esistere su tutte le piattaforme -- altrimenti i
+ * .c dovrebbero avere il proprio #ifdef, che e' esattamente cio' che la regola vieta.
+ * Resta vero che il percorso Linux non e' alterato: nulla viene ridefinito, e la
+ * funzione e' static inline, quindi un TU che non la chiama non paga nulla. */
+#ifndef COMPAT_H
+#define COMPAT_H
+
+#include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>   /* getenv / _putenv_s, used by the Windows env shims */
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+#ifdef __APPLE__
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/types.h>
+
+/* --- posix_fadvise: assente su macOS ---
+ * WILLNEED -> F_RDADVISE (readahead esplicito: stessa semantica).
+ * DONTNEED -> no-op: XNU non espone un drop mirato per-range; la sua unified
+ *             buffer cache si autoregola sotto pressione. Il motore usa DONTNEED
+ *             solo come consiglio, quindi ignorarlo e' corretto (e su una macchina
+ *             con molta RAM tenere le pagine e' proprio cio' che si vuole). */
+#ifndef POSIX_FADV_NORMAL
+#define POSIX_FADV_NORMAL      0
+#define POSIX_FADV_RANDOM      1
+#define POSIX_FADV_SEQUENTIAL  2
+#define POSIX_FADV_WILLNEED    3
+#define POSIX_FADV_DONTNEED    4
+#define POSIX_FADV_NOREUSE     5
+#endif
+static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
+    if(advice==POSIX_FADV_WILLNEED){
+        struct radvisory ra;
+        ra.ra_offset = off;
+        ra.ra_count  = (int)(len>0x7FFFFFFF ? 0x7FFFFFFF : len);
+        return fcntl(fd, F_RDADVISE, &ra)<0 ? -1 : 0;
+    }
+    return 0;
+}
+#define posix_fadvise compat_fadvise
+
+/* --- O_DIRECT: assente su macOS ---
+ * L'equivalente e' F_NOCACHE sul fd (bypass della unified buffer cache).
+ * compat_open_direct() apre il fd "gemello" senza cache, come il twin O_DIRECT
+ * di st.h. Le pread allineate a 4K del chiamante restano valide: F_NOCACHE non
+ * impone vincoli di allineamento. */
+static inline int compat_open_direct(const char *path){
+    int fd = open(path, O_RDONLY);
+    if(fd>=0) fcntl(fd, F_NOCACHE, 1);
+    return fd;
+}
+#endif /* __APPLE__ */
+
+/* ===================================================================
+ * Windows 11 x86-64 (MinGW-w64 / MSYS2)
+ * ===================================================================
+ * pread         -> compat_pread  (ReadFile + OVERLAPPED su raw handle:
+ *                                  thread-safe, 64-bit offset, no CRT
+ *                                  text-mode translation — NEVER use
+ *                                  _read/_lseeki64 which are racy AND
+ *                                  corrupt 0x0A bytes in binary files).
+ * posix_fadvise -> bounded background WILLNEED; other advice is a no-op.
+ * mlock         -> compat_mlock  (VirtualLock + crescita working set).
+ * posix_memalign->_aligned_malloc(free must be compat_aligned_free).
+ * rename        -> compat_rename (MoveFileEx MOVEFILE_REPLACE_EXISTING;
+ *                                  CRT rename fails EEXIST if dest exists,
+ *                                  breaking stats atomic-write every turn).
+ * meminfo       -> compat_meminfo (GlobalMemoryStatusEx: ullTotalPhys,
+ *                                  ullAvailPhys — approx MemAvailable).
+ * getpid        -> _getpid
+ * =================================================================== */
+#ifdef _WIN32
+
+/* Belt-and-braces: 64-bit off_t mandatory — model is 370 GB, every pread
+ * region can exceed 2 GB. 32-bit off_t silently wraps >4 GB offsets into the
+ * first 4 GB → reads wrong weight bytes → silent token corruption. */
+#if !defined(_FILE_OFFSET_BITS) || _FILE_OFFSET_BITS < 64
+#error "_FILE_OFFSET_BITS=64 required on Windows (add -D_FILE_OFFSET_BITS=64 to CFLAGS)"
+#endif
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#include <direct.h>   /* _mkdir (for the mkdtemp shim below) */
+#include <process.h>
+#include <malloc.h>
+#include <fcntl.h>
+#include <errno.h>
+
+/* --- O_BINARY: belt-and-braces vs CRT text-mode (0x0A byte corruption) --- */
+#ifndef O_BINARY
+#define O_BINARY 0x8000
+#endif
+/* All open() calls for model data must use binary mode.  The compat_pread
+ * wrapper already bypasses CRT via ReadFile on the raw OS handle, so this
+ * is defense-in-depth: if anyone adds a future CRT-based read path, O_BINARY
+ * prevents 0x0A bytes from being silently translated to \r\n. */
+#define COMPAT_O_RDONLY (O_RDONLY | O_BINARY)
+#define COMPAT_O_BINARY O_BINARY
+
+/* WILLNEED schedules bounded background prefetch, including for ordinary
+ * synchronous CRT file handles. Supplying OVERLAPPED to ReadFile alone does
+ * not make such handles asynchronous. The worker owns a duplicate handle and
+ * prefetches a read-only mapping without a throwaway copy of the expert.
+ * DONTNEED remains advisory/no-op: Windows manages standby pages itself. */
+#ifndef POSIX_FADV_NORMAL
+#define POSIX_FADV_NORMAL      0
+#define POSIX_FADV_RANDOM      1
+#define POSIX_FADV_SEQUENTIAL  2
+#define POSIX_FADV_WILLNEED    3
+#define POSIX_FADV_DONTNEED    4
+#define POSIX_FADV_NOREUSE     5
+#endif
+#include "compat_prefetch_win.h"
+static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
+    return advice == POSIX_FADV_WILLNEED ? compat_prefetch_file(fd, off, len) : 0;
+}
+#define posix_fadvise compat_fadvise
+
+/* --- pread -> ReadFile + OVERLAPPED su raw OS handle ---
+ * Thread-safe (no shared seek position). Gestisce offset >4 GB e chunking
+ * per letture >2 GB (anche se i tensori individuali sono nell'ordine dei
+ * MB-centinaia di MB, il wrapper e' robusto per ogni taglia). */
+/* Ultimo GetLastError() di una ReadFile fallita, per thread: il chiamante
+ * (pread_full in glm.c) lo stampa accanto a strerror. Senza questo, OGNI
+ * fallimento Windows collassa in "EIO -> Input/output error" e la diagnosi
+ * dal campo diventa un tirare a indovinare (#307: tre giri di ipotesi tra
+ * tre persone perche' il codice vero non compariva da nessuna parte). */
+static __thread DWORD compat_pread_lasterr __attribute__((unused));
+static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
+    intptr_t osfh = _get_osfhandle(fd);
+    if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }
+    HANDLE h = (HANDLE)osfh;
+    size_t total = 0;
+    while(total < n){
+        size_t chunk = n - total;
+        DWORD chunk32 = (chunk > 0x7FFFFFFF) ? 0x7FFFFFFF : (DWORD)chunk;
+        OVERLAPPED ov = {0};
+        ov.Offset     = (DWORD)( (off + (off_t)total)        & 0xFFFFFFFFULL);
+        ov.OffsetHigh = (DWORD)(((off + (off_t)total) >> 32) & 0xFFFFFFFFULL);
+        DWORD rd = 0;
+        if(!ReadFile(h, (char*)buf + total, chunk32, &rd, &ov)){
+            DWORD err = GetLastError();
+            if(err == ERROR_HANDLE_EOF) break;  /* past EOF → return bytes read (0 if none, matching POSIX pread) */
+            compat_pread_lasterr = err;         /* preserva il codice VERO per il report (#307) */
+            if(err == ERROR_INVALID_HANDLE || err == ERROR_INVALID_FUNCTION) errno = EBADF;
+            else errno = EIO;
+            return -1;
+        }
+        total += rd;
+        if(rd == 0 || rd < chunk32) break;  /* EOF or partial (file truncated) */
+    }
+    return (ssize_t)total;
+}
+#define pread(fd,buf,n,off) compat_pread(fd,buf,n,off)
+
+/* --- mlock -> VirtualLock con crescita del working set ---
+ * VirtualLock fallisce oltre il working set MINIMO del processo (default ~qualche
+ * centinaio di KB): prima si allarga il working set di len + margine, poi si blocca.
+ * Best effort come mlock su Linux: -1 su fallimento, il chiamante decide (pin_wire
+ * lo tratta come non-fatale). SeIncreaseWorkingSetPrivilege e' concesso agli utenti
+ * standard di default. */
+static inline int compat_mlock(const void *addr, size_t len){
+    HANDLE p = GetCurrentProcess();
+    SIZE_T mn = 0, mx = 0;
+    if(GetProcessWorkingSetSize(p, &mn, &mx)){
+        SIZE_T need = len + (SIZE_T)(1u<<20);
+        SetProcessWorkingSetSize(p, mn + need, mx + need);   /* best effort */
+    }
+    return VirtualLock((LPVOID)addr, len) ? 0 : -1;
+}
+static inline int compat_munlock(const void *addr, size_t len){
+    return VirtualUnlock((LPVOID)addr, len) ? 0 : -1;
+}
+
+/* --- posix_memalign -> _aligned_malloc ---
+ * ATTN: memoria allocata con _aligned_malloc DEVE essere liberata con
+ * _aligned_free, NON con free(). Vedi compat_aligned_free sotto.
+ * Audit: l'unico sito che libera memoria aligned e' free(s->slab) in
+ * glm.c:892 (cambiato in compat_aligned_free). s->fslab usa falloc()
+ * (malloc semplice) -> il suo free() resta plain. */
+#ifndef ENOMEM
+#define ENOMEM 12
+#endif
+static inline int compat_posix_memalign(void **memptr, size_t alignment, size_t size){
+    if(alignment < sizeof(void*)) alignment = sizeof(void*);
+    *memptr = _aligned_malloc(size, alignment);
+    return *memptr ? 0 : ENOMEM;
+}
+#define posix_memalign(memptr,alignment,size) compat_posix_memalign(memptr,alignment,size)
+
+/* matching free per memoria aligned di _aligned_malloc */
+#define compat_aligned_free _aligned_free
+
+/* --- meminfo: GlobalMemoryStatusEx ---
+ * ullAvailPhys ~ MemAvailable di Linux (include standby/free/zero pages —
+ * pagine recuperabili senza swap). Guida il cap automatico della cache
+ * expert: se sbagliato, la cache e' mis-sized → swap thrash o OOM. */
+static inline void compat_meminfo(double *total_gb, double *avail_gb){
+    MEMORYSTATUSEX msx = {0};
+    msx.dwLength = sizeof(msx);
+    if(GlobalMemoryStatusEx(&msx)){
+        *total_gb = (double)msx.ullTotalPhys / 1e9;
+        *avail_gb = (double)msx.ullAvailPhys  / 1e9;
+    } else {
+        *total_gb = 0; *avail_gb = 0;
+    }
+}
+
+/* --- rename -> MoveFileEx (CRT rename EEXIST se destinazione esiste) ---
+ * stats_dump_q chiama rename(tmp, path) OGNI turno di serve: dopo il primo
+ * write il file esiste gia', e CRT rename fallisce silenziosamente,
+ * affamando la pipeline REPIN/heat/PIN del suo segnale persistente. */
+static inline int compat_rename(const char *old, const char *new){
+    return MoveFileExA(old, new, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
+}
+#define rename(old,new) compat_rename(old,new)
+
+/* --- getpid -> _getpid --- */
+#define getpid() _getpid()
+
+/* --- rss_gb: getrusage -> GetProcessMemoryInfo ---
+ * ru_maxrss in KB (come Linux): rss_gb() divide per 1e6 → GB corretti. */
+#include <psapi.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "psapi.lib")   /* MSVC: link psapi; MinGW/GCC uses -lpsapi */
+#endif
+struct rusage { long ru_maxrss; };
+#define RUSAGE_SELF 0
+static inline int getrusage(int who, struct rusage *r){
+    (void)who;
+    PROCESS_MEMORY_COUNTERS_EX pmc = {0};
+    pmc.cb = sizeof(pmc);
+    if(GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))){
+        r->ru_maxrss = (long)(pmc.PeakWorkingSetSize / 1024);  /* ru_maxrss = peak, not current */
+        return 0;
+    }
+    r->ru_maxrss = 0; return -1;
+}
+
+/* --- getline -> compat_getline (fgets + realloc) --- */
+#include <sys/types.h>  /* ssize_t */
+static inline ssize_t compat_getline(char **lineptr, size_t *n, FILE *stream){
+    if(!lineptr || !n || !stream){ errno = EINVAL; return -1; }
+    if(!*lineptr || !*n){ *n = 128; free(*lineptr); *lineptr = malloc(*n); if(!*lineptr) return -1; }
+    size_t pos = 0; int c;
+    while((c = fgetc(stream)) != EOF){
+        if(pos + 1 >= *n){ size_t nn = *n * 2; char *np = realloc(*lineptr, nn); if(!np) return -1; *lineptr = np; *n = nn; }
+        (*lineptr)[pos++] = (char)c;
+        if(c == '\n') break;
+    }
+    if(pos == 0) return -1;
+    (*lineptr)[pos] = '\0';
+    return (ssize_t)pos;
+}
+#define getline(lineptr,n,stream) compat_getline(lineptr,n,stream)
+
+/* --- O_DIRECT -> FILE_FLAG_NO_BUFFERING ---
+ * Apre il fd "gemello" senza cache del file system, come il twin O_DIRECT di
+ * st.h su Linux e F_NOCACHE su macOS. Stesso contratto: offset, lunghezza e
+ * buffer del chiamante devono essere allineati a 4K (gli slab expert usano
+ * posix_memalign(4096) e il percorso DIRECT=1 del motore allinea gia' offset
+ * e len); richieste non allineate falliscono con -1, mai dati corrotti.
+ * Il fd si usa con la normale pread() (compat_pread -> ReadFile+OVERLAPPED). */
+static inline int compat_open_direct(const char *path){
+    HANDLE h = CreateFileA(path, GENERIC_READ,
+                           FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, NULL);
+    if(h == INVALID_HANDLE_VALUE) return -1;
+    int fd = _open_osfhandle((intptr_t)h, _O_RDONLY|_O_BINARY);
+    if(fd < 0){ CloseHandle(h); return -1; }
+    return fd;
+}
+
+/* --- dimensione file da fd: GetFileSizeEx ---
+ * La lseek(SEEK_END) del CRT ritorna -1 sui fd NO_BUFFERING (misurato su
+ * UCRT): la dimensione si chiede direttamente al kernel. Funziona su
+ * qualsiasi fd (buffered o direct). -1 su errore. */
+static inline off_t compat_fsize(int fd){
+    intptr_t osfh = _get_osfhandle(fd);
+    if(osfh == -1 || osfh == -2) return -1;
+    LARGE_INTEGER li;
+    if(!GetFileSizeEx((HANDLE)osfh, &li)) return -1;
+    return (off_t)li.QuadPart;
+}
+
+/* --- setenv / unsetenv (assenti su Windows) ---
+ *
+ * A Windows process carries TWO views of its environment and they are not the
+ * same object: the Win32 environment block, which child processes inherit, and
+ * the CRT's own copy, which getenv() reads and which is populated once at
+ * startup. SetEnvironmentVariableA writes the first and leaves the second
+ * alone, so a setenv() followed by getenv() in the same process used to return
+ * the stale value -- silently, which is the worst way to not support
+ * something. Six test files had grown a private _putenv_s helper around it
+ * (#1416, #1417, #1420).
+ *
+ * _putenv_s writes the CRT copy AND keeps the Win32 block in sync, so both
+ * views agree. SetEnvironmentVariableA is kept alongside it so that a CRT that
+ * ever stopped syncing could not quietly break the inheritance the engine
+ * relies on (omp_tune.h's re-exec, inkling's OMP variables): the two calls
+ * write the same value to the two views, which is the invariant that matters.
+ *
+ * One difference from POSIX remains, and cannot be removed: the Windows CRT
+ * has no representation for a variable whose value is the empty string, so
+ * setenv(name, "", 1) REMOVES the variable instead of defining it empty. Code
+ * that distinguishes "" from unset must not rely on it. */
+static inline int compat_setenv(const char *name, const char *value, int overwrite){
+    if(!overwrite && getenv(name)) return 0;
+    int rc = _putenv_s(name, value ? value : "");
+    SetEnvironmentVariableA(name, (value && *value) ? value : NULL);
+    return rc == 0 ? 0 : -1;
+}
+#define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
+
+static inline int compat_unsetenv(const char *name){
+    int rc = _putenv_s(name, "");          /* empty value == remove, on Windows */
+    SetEnvironmentVariableA(name, NULL);
+    return rc == 0 ? 0 : -1;
+}
+#define unsetenv(name) compat_unsetenv(name)
+
+/* --- getenv_utf8: read an env var as UTF-8, not through the ANSI codepage ---
+ * Plain getenv()/_environ are populated by the CRT from the ANSI-codepage view
+ * of the process environment block, not UTF-8. A parent that hands the child a
+ * Unicode value via CreateProcessW's wide env block (e.g. Python's subprocess
+ * module, which coli uses to pass the chat prompt) round-trips correctly only
+ * through GetEnvironmentVariableW; going through narrow getenv() re-encodes it
+ * via CP_ACP first, so any non-ASCII prompt text (Cyrillic, CJK, ...) comes out
+ * corrupted before the byte-level tokenizer ever sees it. Read the wide value
+ * directly and convert straight to UTF-8, bypassing the ANSI codepage entirely.
+ * Returned buffer is intentionally leaked: called a handful of times at
+ * startup, lives for the process. */
+static inline const char *compat_getenv_utf8(const char *name){
+    wchar_t wname[64];
+    if(MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 64) <= 0) return getenv(name);
+    DWORD need = GetEnvironmentVariableW(wname, NULL, 0);
+    if(!need) return NULL;
+    wchar_t *wval = (wchar_t*)malloc(need * sizeof(wchar_t));
+    if(!wval) return NULL;
+    GetEnvironmentVariableW(wname, wval, need);
+    int blen = WideCharToMultiByte(CP_UTF8, 0, wval, -1, NULL, 0, NULL, NULL);
+    char *val = blen>0 ? (char*)malloc((size_t)blen) : NULL;
+    if(val) WideCharToMultiByte(CP_UTF8, 0, wval, -1, val, blen, NULL, NULL);
+    free(wval);
+    return val;
+}
+#define getenv_utf8(name) compat_getenv_utf8(name)
+
+/* --- mkdtemp -> _mktemp + _mkdir (POSIX mkdtemp assente su Windows) ---
+ * Test binaries (test_stops.c) create a scratch dir in the CWD via a
+ * "name_XXXXXX" template; POSIX mkdtemp fills the X's and mkdirs 0700. The
+ * Windows CRT has _mktemp (in-place, same XXXXXX contract) so we compose it.
+ * Returns the template pointer on success, NULL on failure — matching POSIX. */
+static inline char *compat_mkdtemp(char *tmpl){
+    if(!tmpl) return NULL;
+    if(!_mktemp(tmpl)) return NULL;       /* fills the trailing X's in place */
+    if(_mkdir(tmpl) != 0) return NULL;    /* EEXIST is impossible post-_mktemp */
+    return tmpl;
+}
+#define mkdtemp(tmpl) compat_mkdtemp(tmpl)
+
+#endif /* _WIN32 */
+
+#ifndef getenv_utf8
+#define getenv_utf8(name) getenv(name)
+#endif
+
+/* --- compat_aligned_free su piattaforme diverse da Windows ---
+ * Su Linux/macOS, posix_memalign usa free() normale. */
+#ifndef compat_aligned_free
+#define compat_aligned_free free
+#endif
+
+/* --- COMPAT_O_RDONLY: O_RDONLY con O_BINARY su Windows, O_RDONLY puro altrove --- */
+#ifndef COMPAT_O_RDONLY
+#define COMPAT_O_RDONLY O_RDONLY
+#endif
+#ifndef COMPAT_O_BINARY
+#define COMPAT_O_BINARY 0
+#endif
+
+/* --- read-only file mapping -------------------------------------------------
+ * A small ownership-carrying primitive for safetensors that are already in the
+ * engine's final byte representation.  The caller gets a pointer to the exact
+ * requested (possibly unaligned) range while this object retains the aligned
+ * OS view needed to release it safely.
+ *
+ * This does not prefetch or lock pages.  Mapping changes ownership/accounting,
+ * not the model's active working set: pages are faulted when the caller reads
+ * them and remain reclaimable file-backed cache pages. */
+typedef struct {
+    void *base;
+    size_t len;
+#ifdef _WIN32
+    HANDLE mapping;
+#endif
+} compat_ro_map;
+
+static inline int compat_map_readonly(int fd, int64_t off, size_t len,
+                                      compat_ro_map *map, const void **data)
+{
+    if (!map || !data || off < 0 || len == 0) { errno = EINVAL; return -1; }
+    memset(map, 0, sizeof(*map));
+#ifdef _WIN32
+    intptr_t osfh = _get_osfhandle(fd);
+    if (osfh == -1 || osfh == -2) { errno = EBADF; return -1; }
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    uint64_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536u;
+    uint64_t aligned = (uint64_t)off - ((uint64_t)off % gran);
+    uint64_t delta = (uint64_t)off - aligned;
+    if (delta > SIZE_MAX || len > SIZE_MAX - (size_t)delta) { errno = EOVERFLOW; return -1; }
+    size_t view_len = (size_t)delta + len;
+    HANDLE fm = CreateFileMappingA((HANDLE)osfh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!fm) { errno = EIO; return -1; }
+    void *base = MapViewOfFile(fm, FILE_MAP_READ,
+                               (DWORD)(aligned >> 32), (DWORD)(aligned & 0xffffffffu),
+                               view_len);
+    if (!base) { CloseHandle(fm); errno = EIO; return -1; }
+    map->base = base;
+    map->len = view_len;
+    map->mapping = fm;
+    *data = (const char*)base + (size_t)delta;
+#else
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) pg = 4096;
+    uint64_t gran = (uint64_t)pg;
+    uint64_t aligned = (uint64_t)off - ((uint64_t)off % gran);
+    uint64_t delta = (uint64_t)off - aligned;
+    if (delta > SIZE_MAX || len > SIZE_MAX - (size_t)delta) { errno = EOVERFLOW; return -1; }
+    size_t view_len = (size_t)delta + len;
+    void *base = mmap(NULL, view_len, PROT_READ, MAP_SHARED, fd, (off_t)aligned);
+    if (base == MAP_FAILED) return -1;
+    map->base = base;
+    map->len = view_len;
+    *data = (const char*)base + (size_t)delta;
+#endif
+    return 0;
+}
+
+static inline void compat_unmap_readonly(compat_ro_map *map)
+{
+    if (!map || !map->base) return;
+#ifdef _WIN32
+    UnmapViewOfFile(map->base);
+    if (map->mapping) CloseHandle(map->mapping);
+#else
+    munmap(map->base, map->len);
+#endif
+    memset(map, 0, sizeof(*map));
+}
+
+/* --- coli_stdin_readable: "c'e' input su stdin adesso?", senza bloccare ---
+ *
+ * I serve loop di inkling.c e kimi_k3.c usavano select() su fd_set direttamente.
+ * Su Windows quei simboli non esistono in quella forma e le due build FALLIVANO
+ * (misurato: Linux ok, macOS ok, Windows/UCRT64 no) -- ed e' il motivo per cui
+ * le release binarie hanno sempre contenuto il solo motore GLM.
+ *
+ * La logica Windows non e' una traduzione meccanica: ha assorbito due bug.
+ *   #139  select() su un handle di pipe finisce in winsock e ritorna sempre
+ *         SOCKET_ERROR, quindi il loop non accettava mai una richiesta.
+ *   #195  le pipe anonime NON sono oggetti attendibili: WaitForSingleObject su
+ *         di esse e' undefined, e PeekNamedPipe fallisce su handle di file o
+ *         console. Su stdin non-pipe si riporta "niente da leggere" invece di
+ *         bloccare il loop.
+ * Duplicarla una terza volta avrebbe rifatto entrare quei due bug in due motori
+ * dove nessuno li avrebbe cercati: sta qui una volta sola.
+ *
+ * static inline: e' un header condiviso, e un TU che non la usa non deve pagarla. */
+#ifndef _WIN32
+#include <sys/select.h>   /* select(), fd_set, struct timeval */
+#endif
+
+#ifdef _WIN32
+static inline int coli_stdin_readable(void)
+{
+    HANDLE ih = (HANDLE)_get_osfhandle(_fileno(stdin));
+    DWORD avail = 0;
+    if (ih == INVALID_HANDLE_VALUE) return 0;
+    if (PeekNamedPipe(ih, NULL, 0, NULL, &avail, NULL)) return avail > 0;
+    return 0;   /* console/file: nessun poll non bloccante, meglio "niente" che bloccare */
+}
+#else
+static inline int coli_stdin_readable(void)
+{
+    /* fd 0 letterale, non STDIN_FILENO: quella macro vive in <unistd.h>, che questo
+     * header non include su tutte le piattaforme, e stdin e' 0 ovunque per POSIX. */
+    fd_set r; struct timeval tv = {0, 0};
+    FD_ZERO(&r); FD_SET(0, &r);
+    return select(1, &r, NULL, NULL, &tv) > 0 && FD_ISSET(0, &r);
+}
+#endif
+
+/* --- coli_serve_binary_mode: stdin/stdout in BINARY per il protocollo di serve ---
+ *
+ * I motori parlano un protocollo a BYTE con `coli`:
+ *   stdout  \x01\x01READY\x01\x01\n, righe STAT, \x01\x01END\x01\x01\n
+ *   stdin   righe di testo piu' i byte di controllo \x02RESET / \x02MORE
+ * Il gateway confronta i sentinella con endswith() e una regex "^STAT ...", quindi
+ * devono arrivare ESATTI (LF, senza CR).
+ *
+ * Su Windows il CRT apre entrambi gli handle in modalita' TEXT: stdout traduce
+ * '\n' -> '\r\n' (il sentinella READY non combacia MAI e la chat si blocca senza
+ * errore), e stdin traduce '\r\n' -> '\n' e rifiuta la scrittura di byte grezzi con
+ * EINVAL, rompendo il protocollo di controllo. (#195)
+ *
+ * colibri.c lo fa da sempre; inkling.c e kimi_k3.c sono nati senza, e nessuno se n'e'
+ * accorto finche' le release binarie non hanno iniziato a contenere quei motori
+ * (#720 -> #748: Kimi K3 su Windows caricava 93 layer in 42 minuti e poi restava
+ * fermo per sempre, perche' il gateway aspettava un byte gia' storpiato).
+ * Sta QUI e non copiato in ogni motore: e' esattamente cosi' che era sparito.
+ *
+ * No-op su Linux/macOS. */
+static inline void coli_serve_binary_mode(void)
+{
+#ifdef _WIN32
+    _setmode(_fileno(stdin),  _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    setvbuf(stdout, NULL, _IONBF, 0);
+#endif
+}
+
+/* A release archive ships the ENGINES next to the launcher, so on Windows the
+ * first thing a new user does is double-click `colibri.exe` from Explorer. The
+ * engine has no model to load, prints one line and exits -- the console window
+ * appears and vanishes, which reads as "the program does not start" (#1241).
+ *
+ * GetConsoleProcessList reports how many processes share this console: a run
+ * started from a shell has at least the shell too, while a double-click leaves
+ * the engine alone on a console Windows destroys the moment it exits. That is
+ * the only case where holding the window is right, and it is exactly the case
+ * where the message would otherwise be unreadable.
+ *
+ * No-op on Linux/macOS, and no-op on Windows whenever a shell, a script, the
+ * `coli` launcher or CI is on the other end.
+ *
+ * This is the belt, not the braces: an engine that re-execs itself for OpenMP
+ * tuning can still be sharing the console with the exiting parent at the moment
+ * we look, and then the message prints without the pause. `coli.cmd` -- shipped
+ * in the Windows archive and always correct -- is the supported entry point. */
+static inline int coli_console_is_own(void)
+{
+#ifdef _WIN32
+    DWORD owners[2];
+    return GetConsoleProcessList(owners, 2) == 1;
+#else
+    return 0;
+#endif
+}
+
+static inline void coli_hold_console(void)
+{
+    if (!coli_console_is_own()) return;
+    fprintf(stderr, "\nPress Enter to close this window. ");
+    fflush(stderr);
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) { }
+}
+
+/* One wording for every engine: what this binary is, and the command that does
+ * what the user was trying to do. Called on the "no model" exit path, which is
+ * where a bare launch lands. `engine` is the family name for the message,
+ * `by_hand` how this binary itself is run (they differ: some read the model
+ * from SNAP, some from their first argument; #1906). */
+static inline void coli_print_launcher_help(const char *engine, const char *by_hand)
+{
+#ifdef _WIN32
+    const char *run = "coli.cmd";
+#else
+    const char *run = "./coli";
+#endif
+    fprintf(stderr,
+        "colibri: this is the %s engine, and it was started without a model.\n"
+        "The engine is not the program you run directly -- the launcher is:\n"
+        "\n"
+        "    %s chat  --model <model directory>    interactive chat\n"
+        "    %s serve --model <model directory>    OpenAI-compatible API\n"
+        "    %s web   --model <model directory>    API plus the dashboard\n"
+        "    %s doctor --model <model directory>   check a model is usable\n"
+        "\n"
+        "The launcher needs Python 3 and picks the right engine for the model.\n"
+        "(Running the engine by hand: %s)\n"
+        "Getting a model, step by step: https://github.com/JustVugg/colibri"
+        "/blob/main/docs/quickstart.md\n",
+        engine, run, run, run, run, by_hand);
+    coli_hold_console();
+}
+
+/* --- RAM disponibile ADESSO, in GB, per tutte le piattaforme ---------------
+ * "Disponibile" = recuperabile senza swap: MemAvailable su Linux; free +
+ * inactive + purgeable su macOS; su Windows ullAvailPhys MA limitata da
+ * ullAvailPageFile, il commit ancora concedibile: e' quello che decide se
+ * il prossimo malloc riesce, e su una macchina con pagefile piccolo puo'
+ * essere molto meno della RAM fisica libera.
+ *
+ * #1375: glm53.c leggeva /proc/meminfo ovunque, e su Windows quel file non
+ * esiste: la funzione tornava 0, il budget della cache esperti si clampava a
+ * 1 GB, e Flash su Windows girava con uno slot per layer. colibri.c aveva la
+ * versione giusta (macOS + Windows) da mesi, come funzione sua. Due copie di
+ * cui una sbagliata: ora e' una, qui, e i motori la chiamano.
+ * 0 = non misurabile; e' il chiamante a decidere il fallback. */
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#endif
+#include <unistd.h>
+
+/* Total AND available in one call, one pass.
+ *
+ * "Available" alone was consolidated here by #1375 because there were two
+ * copies of it and one was wrong. "Total" is now in the same position: every
+ * caller that wants it hand-rolls its own #ifdef ladder (telemetry.h uses
+ * sysctl hw.memsize on macOS, olmoe.c uses sysconf(_SC_PHYS_PAGES), glm53.c
+ * read /proc/meminfo unconditionally), and those definitions do not agree.
+ * A budget computed from a total and an available that came from two
+ * different definitions is not a budget, it is a coincidence.
+ *
+ * One pass also matters on Linux specifically: MemTotal and MemAvailable are
+ * two lines of the same file, and reading it twice to get them is both a
+ * second open and a second chance to read a file that changed underneath.
+ *
+ * 0 means "not measurable" for either field; the caller decides the fallback. */
+static inline void compat_meminfo_gb(double *total_gb, double *avail_gb){
+    double total = 0, avail = 0;
+#ifdef __APPLE__
+    uint64_t memsize = 0; size_t len = sizeof memsize;
+    if(sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0) total = (double)memsize / 1e9;
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm;
+    if(host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &cnt) == KERN_SUCCESS)
+        avail = ((double)vm.free_count + (double)vm.inactive_count + (double)vm.purgeable_count)
+                * (double)sysconf(_SC_PAGESIZE) / 1e9;
+#elif defined(_WIN32)
+    MEMORYSTATUSEX msx = {0};
+    msx.dwLength = sizeof(msx);
+    if(GlobalMemoryStatusEx(&msx)){
+        total = (double)msx.ullTotalPhys / 1e9;
+        double phys = (double)msx.ullAvailPhys / 1e9;
+        double commit = (double)msx.ullAvailPageFile / 1e9;
+        avail = commit > 0 && commit < phys ? commit : phys;
+    }
+#else
+    FILE *f = fopen("/proc/meminfo", "r");
+    if(f){
+        char ln[256]; double kb;
+        /* /proc/meminfo's "kB" is KiB (1024 B), so a GB is kb*1024/1e9, not
+         * kb/1e6. The old kb/1e6 understated by 2.3% -- harmless while the
+         * number was only ever compared against itself, but glm53 now weighs
+         * it against a model size computed from byte counts (/1e9, true GB),
+         * and a budget that subtracts true GB from understated GB is wrong in
+         * the direction that matters: it hands back less than it should. */
+        /* MemTotal precedes MemAvailable in /proc/meminfo, but do not rely on
+         * the order: stop only once both have been seen. */
+        while((total == 0 || avail == 0) && fgets(ln, sizeof ln, f)){
+            if(total == 0 && sscanf(ln, "MemTotal: %lf", &kb) == 1){ total = kb * 1024.0 / 1e9; continue; }
+            if(avail == 0 && sscanf(ln, "MemAvailable: %lf", &kb) == 1) avail = kb * 1024.0 / 1e9;
+        }
+        fclose(f);
+    }
+#endif
+    if(total_gb) *total_gb = total;
+    if(avail_gb) *avail_gb = avail;
+}
+
+static inline double compat_mem_available_gb(void){
+    double avail = 0;
+    compat_meminfo_gb(NULL, &avail);
+    return avail;
+}
+
+
+#endif /* COMPAT_H */
